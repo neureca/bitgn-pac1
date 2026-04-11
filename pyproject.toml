@@ -1,0 +1,19 @@
+[project]
+name = "hackathon-agent-security"
+version = "0.1.0"
+description = "Minimal BitGN PAC1 runtime client"
+readme = "AGENTS.md"
+requires-python = ">=3.12"
+dependencies = [
+    "annotated-types>=0.7.0",
+    "bitgn-api-connectrpc-python==0.9.0.1.20260405144405+6b39e6872349",
+    "bitgn-api-protocolbuffers-python==34.1.0.1.20260405144405+6b39e6872349",
+    "openai>=2.26.0",
+    "pydantic>=2.12.5",
+]
+
+[[tool.uv.index]]
+url = "https://buf.build/gen/python"
+
+[tool.uv]
+package = false
