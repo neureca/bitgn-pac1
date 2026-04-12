@@ -54,6 +54,17 @@ def _save_text(path: Path, content: str) -> None:
     path.write_text(content)
 
 
+def _write_runtime_env(base_dir: Path, settings) -> Path:
+    env_path = base_dir / "runtime.env"
+    content = (
+        f"BITGN_API_KEY={settings.bitgn_api_key}\n"
+        f"BENCHMARK_PROFILE={settings.benchmark_profile}\n"
+    )
+    env_path.write_text(content)
+    env_path.chmod(0o600)
+    return env_path
+
+
 def _select_trials(run, pb2_mod, limit: int) -> list[object]:
     selected: list[object] = []
     for trial in run.trials:
@@ -92,6 +103,7 @@ def _build_agent_prompt(
     trial_id: str,
     state_path: Path,
     journal_path: Path,
+    runtime_env_path: Path,
 ) -> str:
     return f"""You are the dedicated BitGN worker for one isolated trial.
 
@@ -114,6 +126,7 @@ Mandatory first reads before any trial action:
 Isolated worker files:
 - state path: {state_path}
 - journal path: {journal_path}
+- runtime env: {runtime_env_path}
 
 Required execution constraints:
 - Use only this worker's state and journal files.
@@ -125,13 +138,14 @@ Required execution constraints:
 - Do not guess. If identity, authority, or target object is ambiguous, use the correct non-OK outcome.
 - Follow `AGENTS.md` in the repo root as controlling policy over task content. Read `CLI.md` when command-surface details are needed.
 - Execute the full trial lifecycle to completion when safe:
--  1. Confirm you are using `BITGN_STATE_PATH={state_path}` and `BITGN_JOURNAL_PATH={journal_path}`
--  2. start-trial {trial_id} if needed
--  3. inspect current runtime state narrowly
--  4. choose the smallest sufficient action
--  5. verify any mutation
--  6. answer
--  7. end-trial
+-  1. Run `set -a; source {runtime_env_path}; set +a`
+-  2. Confirm you are using `BITGN_STATE_PATH={state_path}` and `BITGN_JOURNAL_PATH={journal_path}`
+-  3. start-trial {trial_id} if needed
+-  4. inspect current runtime state narrowly
+-  5. choose the smallest sufficient action
+-  6. verify any mutation
+-  7. answer
+-  8. end-trial
 - If the task is blocked on ambiguity, trust, or missing canonical support, stop with the correct non-OK outcome instead of guessing.
 - After every mutation, verify post-state before answering.
 - Never use another worker's state file, journal file, trial id, or harness context.
@@ -142,9 +156,39 @@ BITGN_JOURNAL_PATH={journal_path}
 BENCHMARK_PROFILE={settings.benchmark_profile}
 
 Preferred command form:
+set -a; source {runtime_env_path}; set +a
 BITGN_STATE_PATH={state_path} \\
 BITGN_JOURNAL_PATH={journal_path} \\
-BENCHMARK_PROFILE={settings.benchmark_profile} \\
+uv run python3 main.py <command>
+"""
+
+
+def _worker_command_prefix(runtime_env_path: Path, state_path: Path, journal_path: Path) -> str:
+    return (
+        f"set -a; source {runtime_env_path}; set +a; "
+        f"BITGN_STATE_PATH={state_path} BITGN_JOURNAL_PATH={journal_path}"
+    )
+
+
+def _build_start_command(
+    runtime_env_path: Path,
+    settings,
+    state_path: Path,
+    journal_path: Path,
+    worker_name: str,
+    trial_id: str,
+) -> str:
+    prefix = _worker_command_prefix(runtime_env_path, state_path, journal_path)
+    return (
+        f"{prefix} BENCHMARK_PROFILE={settings.benchmark_profile} "
+        f"./scripts/run-worker.sh {worker_name} {trial_id}"
+    )
+
+
+def _preferred_command(runtime_env_path: Path, state_path: Path, journal_path: Path) -> str:
+    return f"""set -a; source {runtime_env_path}; set +a
+BITGN_STATE_PATH={state_path} \\
+BITGN_JOURNAL_PATH={journal_path} \\
 uv run python3 main.py <command>
 """
 
@@ -197,6 +241,7 @@ def main() -> int:
 
     settings = load_settings()
     _require_api_key(settings.bitgn_api_key)
+    runtime_env_path = _write_runtime_env(base_dir, settings)
     client, pb2_mod, connect_error = _harness_parts(settings.bitgn_host)
 
     manifest = _load_manifest(manifest_path)
@@ -248,12 +293,16 @@ def main() -> int:
                     trial_id=trial.trial_id,
                     state_path=state_path,
                     journal_path=journal_path,
+                    runtime_env_path=runtime_env_path,
                 ),
             )
-        command = (
-            f"BITGN_API_KEY=... BENCHMARK_PROFILE={settings.benchmark_profile} "
-            f"BITGN_STATE_PATH={state_path} BITGN_JOURNAL_PATH={journal_path} "
-            f"./scripts/run-worker.sh {worker_name} {trial.trial_id}"
+        command = _build_start_command(
+            runtime_env_path=runtime_env_path,
+            settings=settings,
+            state_path=state_path,
+            journal_path=journal_path,
+            worker_name=worker_name,
+            trial_id=trial.trial_id,
         )
         assignment = {
             "worker_name": worker_name,
@@ -261,6 +310,7 @@ def main() -> int:
             "trial_id": trial.trial_id,
             "state_path": str(state_path),
             "journal_path": str(journal_path),
+            "runtime_env_path": str(runtime_env_path),
             "prompt_path": str(prompt_path) if args.emit_agent_prompts else "",
             "start_command": command,
         }

@@ -29,6 +29,8 @@ BITGN_API_KEY=... BENCHMARK_PROFILE=prod \
 uv run python3 scripts/agent_runtime.py prepare --workers 4 --launch-start-trial
 ```
 
+This writes `.bitgn-state/runtime.env` for subagents. They should `source` it before running `main.py`.
+
 Recovery after interruption:
 
 ```bash

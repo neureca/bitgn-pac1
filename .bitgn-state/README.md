@@ -7,6 +7,7 @@ Recommended naming:
 - state: `.bitgn-state/<worker-name>.run.json`
 - journal: `.bitgn-state/<worker-name>.journal.jsonl`
 - prompt: `.bitgn-state/<worker-name>.prompt.md`
+- runtime env: `.bitgn-state/runtime.env`
 
 Example:
 
@@ -18,6 +19,7 @@ uv run python3 main.py start-trial vm-...
 ```
 
 Each worker must use its own `BITGN_STATE_PATH` and `BITGN_JOURNAL_PATH`.
+Before a subagent runs CLI commands, it should load `.bitgn-state/runtime.env`.
 
 Coordinator helper:
 
@@ -31,6 +33,7 @@ This will:
 
 - create or reuse a run for the parallel worker manifest
 - select the next `NEW` trials
+- write `.bitgn-state/runtime.env` with local auth and profile values for subagents
 - create isolated state and journal files under `.bitgn-state/`
 - write one ready-to-use agent prompt file per worker
 - optionally initialize each worker with an explicit `start-trial <trial_id>`
@@ -45,6 +48,7 @@ uv run python3 scripts/prepare_agent_launch_manifest.py --workers 4 --launch-sta
 This writes `.bitgn-state/agent-launch-manifest.json` with one entry per trial worker, including:
 
 - isolated state and journal paths
+- the shared runtime env path for local auth bootstrap
 - a ready-to-use `.prompt.md`
 - a compact `spawn_recommendation` block that points the agent at the prompt file instead of embedding the full prompt again
 
