@@ -10,15 +10,16 @@ if [[ -z "${BITGN_API_KEY:-}" ]]; then
 fi
 
 PROFILE="${BENCHMARK_PROFILE:-prod}"
+PYTHON_CMD=(uv run python3)
 
 echo "== session =="
-BENCHMARK_PROFILE="$PROFILE" python3 main.py session
+BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py session
 
 echo "== start-trial =="
-BENCHMARK_PROFILE="$PROFILE" python3 main.py start-trial "${1:-}"
+BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py start-trial "${1:-}"
 
 echo "== inspect =="
-BENCHMARK_PROFILE="$PROFILE" python3 main.py inspect
+BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py inspect
 
 echo "== session =="
-BENCHMARK_PROFILE="$PROFILE" python3 main.py session
+BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py session

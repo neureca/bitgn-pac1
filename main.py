@@ -323,7 +323,7 @@ def _ensure_active_trial(state: OperatorState) -> int | None:
     if state.trial_id and state.harness_url:
         return None
     print("No active trial in saved state.")
-    print("Start a trial first with `python3 main.py start-trial`.")
+    print("Start a trial first with `uv run python3 main.py start-trial`.")
     return 2
 
 
@@ -490,9 +490,7 @@ def _append_journal_entry(settings: Settings, state: OperatorState, result: Any)
         "task_id": state.task_id,
         "trial_id": state.trial_id,
         "answer_outcome": state.answer_outcome,
-        "score": result.score,
         "trial_state": int(result.state),
-        "score_detail": list(result.score_detail),
     }
     journal_path = Path(settings.journal_path)
     journal_path.parent.mkdir(parents=True, exist_ok=True)
@@ -667,7 +665,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
         if state.answer_sent:
             print(
                 "Saved session already has an answered trial. "
-                "Finish it with `python3 main.py end-trial` or clear the session."
+                "Finish it with `uv run python3 main.py end-trial` or clear the session."
             )
             return 2
         try:
@@ -931,7 +929,7 @@ def _handle_end_trial(args: argparse.Namespace, settings: Settings, state: Opera
         return 2
     if not state.answer_sent and not args.allow_unanswered:
         print("Refusing to end trial before answer.")
-        print("Send `python3 main.py answer ...` first or use `python3 main.py end-trial --allow-unanswered`.")
+        print("Send `uv run python3 main.py answer ...` first or use `uv run python3 main.py end-trial --allow-unanswered`.")
         return 2
 
     client, pb2_mod, connect_error = _harness_parts(settings)

@@ -11,6 +11,7 @@ fi
 
 STATE_FILE="$(mktemp)"
 trap 'rm -f "$STATE_FILE"' EXIT
+PYTHON_CMD=(uv run python3)
 
 cat >"$STATE_FILE" <<'JSON'
 {
@@ -27,7 +28,7 @@ cat >"$STATE_FILE" <<'JSON'
 JSON
 
 echo "== answer should be blocked before network =="
-if BITGN_STATE_PATH="$STATE_FILE" BENCHMARK_PROFILE=prod python3 main.py answer \
+if BITGN_STATE_PATH="$STATE_FILE" BENCHMARK_PROFILE=prod "${PYTHON_CMD[@]}" main.py answer \
   --outcome OUTCOME_OK \
   --message "Updated /docs/todo.txt" \
   --ref /docs/todo.txt; then
@@ -36,4 +37,4 @@ if BITGN_STATE_PATH="$STATE_FILE" BENCHMARK_PROFILE=prod python3 main.py answer 
 fi
 
 echo "== guard behaved as expected =="
-BITGN_STATE_PATH="$STATE_FILE" python3 main.py session
+BITGN_STATE_PATH="$STATE_FILE" "${PYTHON_CMD[@]}" main.py session

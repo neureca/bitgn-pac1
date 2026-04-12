@@ -14,7 +14,7 @@ Example:
 BITGN_STATE_PATH=.bitgn-state/worker-t012.run.json \
 BITGN_JOURNAL_PATH=.bitgn-state/worker-t012.journal.jsonl \
 BENCHMARK_PROFILE=prod \
-.venv/bin/python3 main.py start-trial vm-...
+uv run python3 main.py start-trial vm-...
 ```
 
 Each worker must use its own `BITGN_STATE_PATH` and `BITGN_JOURNAL_PATH`.
@@ -22,8 +22,9 @@ Each worker must use its own `BITGN_STATE_PATH` and `BITGN_JOURNAL_PATH`.
 Coordinator helper:
 
 ```bash
+uv sync
 BITGN_API_KEY=... BENCHMARK_PROFILE=prod \
-.venv/bin/python3 scripts/prepare_parallel_workers.py --workers 4 --launch-start-trial --emit-agent-prompts
+uv run python3 scripts/prepare_parallel_workers.py --workers 4 --launch-start-trial --emit-agent-prompts
 ```
 
 This will:
@@ -38,20 +39,20 @@ Agent-launch manifest helper:
 
 ```bash
 BITGN_API_KEY=... BENCHMARK_PROFILE=prod \
-.venv/bin/python3 scripts/prepare_agent_launch_manifest.py --workers 4 --launch-start-trial
+uv run python3 scripts/prepare_agent_launch_manifest.py --workers 4 --launch-start-trial
 ```
 
 This writes `.bitgn-state/agent-launch-manifest.json` with one entry per trial worker, including:
 
 - isolated state and journal paths
 - a ready-to-use `.prompt.md`
-- a `spawn_recommendation` block that can be mapped directly into a `spawn_agent` call
+- a compact `spawn_recommendation` block that points the agent at the prompt file instead of embedding the full prompt again
 
 Runtime registry helper:
 
 ```bash
 BITGN_API_KEY=... BENCHMARK_PROFILE=prod \
-.venv/bin/python3 scripts/agent_runtime.py prepare --workers 4 --launch-start-trial
+uv run python3 scripts/agent_runtime.py prepare --workers 4 --launch-start-trial
 ```
 
 This also maintains `.bitgn-state/agents-runtime.json` so agent launches can be resumed after interruption.
@@ -59,11 +60,11 @@ This also maintains `.bitgn-state/agents-runtime.json` so agent launches can be 
 Useful commands:
 
 ```bash
-.venv/bin/python3 scripts/agent_runtime.py status
-.venv/bin/python3 scripts/agent_runtime.py mark-started --run-id <run> --worker-name <worker> --agent-id <agent>
-.venv/bin/python3 scripts/agent_runtime.py mark-finished --run-id <run> --worker-name <worker> --status completed
-.venv/bin/python3 scripts/agent_runtime.py mark-interrupted --run-id <run> --worker-name <worker> --error "..."
-.venv/bin/python3 scripts/agent_runtime.py recover --run-id <run>
+uv run python3 scripts/agent_runtime.py status
+uv run python3 scripts/agent_runtime.py mark-started --run-id <run> --worker-name <worker> --agent-id <agent>
+uv run python3 scripts/agent_runtime.py mark-finished --run-id <run> --worker-name <worker> --status completed
+uv run python3 scripts/agent_runtime.py mark-interrupted --run-id <run> --worker-name <worker> --error "..."
+uv run python3 scripts/agent_runtime.py recover --run-id <run>
 ```
 
 Recovery playbook:

@@ -105,6 +105,12 @@ def main() -> int:
             if exit_code != 0:
                 return exit_code
 
+        launch_message = (
+            f"You own only trial {trial.trial_id} ({trial.task_id}). "
+            f"Read {prompt_path} and follow it exactly. "
+            f"Use only its isolated state and journal files."
+        )
+
         assignments.append(
             {
                 "worker_name": worker_name,
@@ -113,13 +119,12 @@ def main() -> int:
                 "state_path": str(state_path),
                 "journal_path": str(journal_path),
                 "prompt_path": str(prompt_path),
-                "prompt_markdown": prompt_markdown,
                 "spawn_recommendation": {
                     "agent_type": "default",
                     "model": args.model,
                     "reasoning_effort": args.reasoning_effort,
-                    "fork_context": True,
-                    "message": prompt_markdown,
+                    "fork_context": False,
+                    "message": launch_message,
                 },
             }
         )
