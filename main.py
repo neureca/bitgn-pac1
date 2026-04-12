@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -496,6 +498,51 @@ def _append_journal_entry(settings: Settings, state: OperatorState, result: Any)
     journal_path.parent.mkdir(parents=True, exist_ok=True)
     with journal_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def _handle_jq(args: argparse.Namespace) -> int:
+    jq_binary = shutil.which("jq")
+    if not jq_binary:
+        print("Missing jq on PATH.")
+        return 2
+
+    if args.stdin and args.file:
+        print("Use either --stdin or --file, not both.")
+        return 2
+    if not args.stdin and not args.file:
+        print("Provide --stdin or --file.")
+        return 2
+
+    command = [jq_binary]
+    if args.raw:
+        command.append("-r")
+    if args.pretty is not None:
+        command.extend(["--indent", str(args.pretty)])
+    if args.file:
+        command.extend([args.query, args.file])
+        input_text = None
+    else:
+        command.append(args.query)
+        input_text = sys.stdin.read()
+
+    try:
+        result = subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"jq timed out after {args.timeout}s")
+        return 1
+
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0 and result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 def _handle_preanswer(settings: Settings, state: OperatorState) -> int:
@@ -1037,6 +1084,15 @@ def _build_parser() -> argparse.ArgumentParser:
     answer_ok_parser.add_argument("--ref", action="append", default=[], help="Grounding ref; may be repeated")
     answer_ok_parser.set_defaults(handler="answer-ok")
 
+    jq_parser = subparsers.add_parser("jq", help="Run a read-only jq query over JSON from stdin or a file")
+    jq_parser.add_argument("--query", required=True, help="jq query expression")
+    jq_parser.add_argument("--file", help="Path to a JSON file")
+    jq_parser.add_argument("--stdin", action="store_true", help="Read JSON from stdin")
+    jq_parser.add_argument("--raw", action="store_true", help="Use jq raw output mode (-r)")
+    jq_parser.add_argument("--pretty", type=int, choices=[0, 1, 2, 3, 4, 5, 6, 7, 8], help="Override jq indent width")
+    jq_parser.add_argument("--timeout", type=int, default=2, help="jq subprocess timeout in seconds")
+    jq_parser.set_defaults(handler="jq")
+
     return parser
 
 
@@ -1099,6 +1155,8 @@ def main() -> int:
             return _handle_end_trial(args, settings, state, state_path)
         if args.handler == "answer-ok":
             return _handle_answer_ok(args, settings, state, state_path)
+        if args.handler == "jq":
+            return _handle_jq(args)
         if args.handler == "pcm":
             return _execute_pcm(args.command, args, settings, state, state_path)
         parser.print_help()

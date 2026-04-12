@@ -35,6 +35,13 @@ Recovery after interruption:
 
 `recover` is read-only. Increment retry state only after a real relaunch via `mark-started`.
 
+JSON query helper:
+
+```bash
+printf '{"items":[{"id":1},{"id":2}]}\n' | .venv/bin/python3 main.py jq --stdin --query '.items | length'
+.venv/bin/python3 main.py jq --file payload.json --query '.items[] | .id' --raw
+```
+
 ## Design note
 
 This operator CLI intentionally does not run an internal LLM decision loop.
