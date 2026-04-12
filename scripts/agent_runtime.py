@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,6 +16,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 STATE_DIR = ROOT_DIR / ".bitgn-state"
 REGISTRY_PATH = STATE_DIR / "agents-runtime.json"
 MANIFEST_PATH = STATE_DIR / "agent-launch-manifest.json"
+LOCK_PATH = STATE_DIR / "agents-runtime.lock"
 
 
 def _utc_now() -> str:
@@ -31,7 +35,9 @@ def _load_json(path: Path) -> dict[str, object]:
 
 def _save_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2) + "\n")
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2) + "\n")
+    os.replace(temp_path, path)
 
 
 def _load_registry() -> dict[str, object]:
@@ -42,6 +48,25 @@ def _load_registry() -> dict[str, object]:
 
 def _save_registry(payload: dict[str, object]) -> None:
     _save_json(REGISTRY_PATH, payload)
+
+
+def _with_registry_lock(func, *, timeout_sec: float = 5.0):
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + timeout_sec
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    print(f"Timed out waiting for registry lock: {LOCK_PATH}", file=sys.stderr)
+                    raise SystemExit(2)
+                time.sleep(0.05)
+        try:
+            return func()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _load_manifest() -> dict[str, object]:
@@ -160,9 +185,14 @@ def _cmd_prepare(args: argparse.Namespace) -> int:
         return result.returncode
 
     manifest = _load_manifest()
-    registry = _load_registry()
-    run_entry = _sync_registry_from_manifest(registry, manifest)
-    _save_registry(registry)
+
+    def _update() -> dict[str, object]:
+        registry = _load_registry()
+        run_entry = _sync_registry_from_manifest(registry, manifest)
+        _save_registry(registry)
+        return run_entry
+
+    run_entry = _with_registry_lock(_update)
     print(f"Registry: {REGISTRY_PATH}")
     print(f"Prepared workers: {len(run_entry['workers'])}")
     return 0
@@ -194,48 +224,54 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_mark_started(args: argparse.Namespace) -> int:
-    registry = _load_registry()
-    run_entry = _find_run(registry, args.run_id)
-    if run_entry is None:
-        print(f"Unknown run_id: {args.run_id}", file=sys.stderr)
-        return 2
-    worker = _find_worker(run_entry, args.worker_name)
-    if worker is None:
-        print(f"Unknown worker_name for run {args.run_id}: {args.worker_name}", file=sys.stderr)
-        return 2
-    if worker.get("status") == "interrupted":
-        worker["retry_count"] = int(worker.get("retry_count", 0) or 0) + 1
-    worker["agent_id"] = args.agent_id
-    worker["status"] = "running"
-    worker["started_at"] = _utc_now()
-    worker["finished_at"] = ""
-    worker["last_transition_at"] = _utc_now()
-    worker["last_error"] = ""
-    run_entry["updated_at"] = _utc_now()
-    _save_registry(registry)
+    def _update() -> None:
+        registry = _load_registry()
+        run_entry = _find_run(registry, args.run_id)
+        if run_entry is None:
+            print(f"Unknown run_id: {args.run_id}", file=sys.stderr)
+            raise SystemExit(2)
+        worker = _find_worker(run_entry, args.worker_name)
+        if worker is None:
+            print(f"Unknown worker_name for run {args.run_id}: {args.worker_name}", file=sys.stderr)
+            raise SystemExit(2)
+        if worker.get("status") == "interrupted":
+            worker["retry_count"] = int(worker.get("retry_count", 0) or 0) + 1
+        worker["agent_id"] = args.agent_id
+        worker["status"] = "running"
+        worker["started_at"] = _utc_now()
+        worker["finished_at"] = ""
+        worker["last_transition_at"] = _utc_now()
+        worker["last_error"] = ""
+        run_entry["updated_at"] = _utc_now()
+        _save_registry(registry)
+
+    _with_registry_lock(_update)
     print(f"Marked started: {args.worker_name} -> {args.agent_id}")
     return 0
 
 
 def _cmd_mark_finished(args: argparse.Namespace) -> int:
-    registry = _load_registry()
-    run_entry = _find_run(registry, args.run_id)
-    if run_entry is None:
-        print(f"Unknown run_id: {args.run_id}", file=sys.stderr)
-        return 2
-    worker = _find_worker(run_entry, args.worker_name)
-    if worker is None:
-        print(f"Unknown worker_name for run {args.run_id}: {args.worker_name}", file=sys.stderr)
-        return 2
-    worker["status"] = args.status
-    worker["finished_at"] = _utc_now()
-    worker["last_transition_at"] = _utc_now()
-    if args.note:
-        worker["notes"] = args.note
-    if args.error:
-        worker["last_error"] = args.error
-    run_entry["updated_at"] = _utc_now()
-    _save_registry(registry)
+    def _update() -> None:
+        registry = _load_registry()
+        run_entry = _find_run(registry, args.run_id)
+        if run_entry is None:
+            print(f"Unknown run_id: {args.run_id}", file=sys.stderr)
+            raise SystemExit(2)
+        worker = _find_worker(run_entry, args.worker_name)
+        if worker is None:
+            print(f"Unknown worker_name for run {args.run_id}: {args.worker_name}", file=sys.stderr)
+            raise SystemExit(2)
+        worker["status"] = args.status
+        worker["finished_at"] = _utc_now()
+        worker["last_transition_at"] = _utc_now()
+        if args.note:
+            worker["notes"] = args.note
+        if args.error:
+            worker["last_error"] = args.error
+        run_entry["updated_at"] = _utc_now()
+        _save_registry(registry)
+
+    _with_registry_lock(_update)
     print(f"Marked {args.status}: {args.worker_name}")
     return 0
 
@@ -261,61 +297,69 @@ def _cmd_next_pending(args: argparse.Namespace) -> int:
 
 
 def _cmd_mark_interrupted(args: argparse.Namespace) -> int:
-    registry = _load_registry()
-    run_entry = _find_run(registry, args.run_id)
-    if run_entry is None:
-        print(f"Unknown run_id: {args.run_id}", file=sys.stderr)
-        return 2
-    worker = _find_worker(run_entry, args.worker_name)
-    if worker is None:
-        print(f"Unknown worker_name for run {args.run_id}: {args.worker_name}", file=sys.stderr)
-        return 2
-    worker["status"] = "interrupted"
-    worker["last_transition_at"] = _utc_now()
-    if args.error:
-        worker["last_error"] = args.error
-    if args.note:
-        worker["notes"] = args.note
-    run_entry["updated_at"] = _utc_now()
-    _save_registry(registry)
+    def _update() -> None:
+        registry = _load_registry()
+        run_entry = _find_run(registry, args.run_id)
+        if run_entry is None:
+            print(f"Unknown run_id: {args.run_id}", file=sys.stderr)
+            raise SystemExit(2)
+        worker = _find_worker(run_entry, args.worker_name)
+        if worker is None:
+            print(f"Unknown worker_name for run {args.run_id}: {args.worker_name}", file=sys.stderr)
+            raise SystemExit(2)
+        worker["status"] = "interrupted"
+        worker["last_transition_at"] = _utc_now()
+        if args.error:
+            worker["last_error"] = args.error
+        if args.note:
+            worker["notes"] = args.note
+        run_entry["updated_at"] = _utc_now()
+        _save_registry(registry)
+
+    _with_registry_lock(_update)
     print(f"Marked interrupted: {args.worker_name}")
     return 0
 
 
 def _cmd_recover(args: argparse.Namespace) -> int:
-    registry = _load_registry()
-    run_entry = _find_run(registry, args.run_id)
-    if run_entry is None:
-        print(f"Unknown run_id: {args.run_id}", file=sys.stderr)
-        return 2
+    def _collect() -> list[dict[str, object]]:
+        registry = _load_registry()
+        run_entry = _find_run(registry, args.run_id)
+        if run_entry is None:
+            print(f"Unknown run_id: {args.run_id}", file=sys.stderr)
+            raise SystemExit(2)
 
-    recovery: list[dict[str, object]] = []
-    for worker in run_entry.get("workers", []):
-        if not isinstance(worker, dict):
-            continue
-        status = str(worker.get("status") or "")
-        retry_count = int(worker.get("retry_count", 0) or 0)
-        if status == "prepared":
-            action = "launch"
-        elif status == "interrupted" and retry_count < args.max_retries:
-            action = "retry"
-        else:
-            continue
-        recovery.append(
-            {
-                "worker_name": worker.get("worker_name", ""),
-                "task_id": worker.get("task_id", ""),
-                "trial_id": worker.get("trial_id", ""),
-                "status": worker.get("status", ""),
-                "retry_count": retry_count,
-                "action": action,
-                "state_path": worker.get("state_path", ""),
-                "journal_path": worker.get("journal_path", ""),
-                "prompt_path": worker.get("prompt_path", ""),
-            }
-        )
+        recovery: list[dict[str, object]] = []
+        for worker in run_entry.get("workers", []):
+            if not isinstance(worker, dict):
+                continue
+            status = str(worker.get("status") or "")
+            retry_count = int(worker.get("retry_count", 0) or 0)
+            if status == "prepared":
+                action = "launch"
+            elif status == "interrupted" and retry_count < args.max_retries:
+                action = "retry"
+            else:
+                continue
+            recovery.append(
+                {
+                    "worker_name": worker.get("worker_name", ""),
+                    "task_id": worker.get("task_id", ""),
+                    "trial_id": worker.get("trial_id", ""),
+                    "status": worker.get("status", ""),
+                    "retry_count": retry_count,
+                    "action": action,
+                    "state_path": worker.get("state_path", ""),
+                    "journal_path": worker.get("journal_path", ""),
+                    "prompt_path": worker.get("prompt_path", ""),
+                }
+            )
 
-    run_entry["updated_at"] = _utc_now()
+        run_entry["updated_at"] = _utc_now()
+        _save_registry(registry)
+        return recovery
+
+    recovery = _with_registry_lock(_collect)
 
     if not recovery:
         print("No workers eligible for recovery.")
