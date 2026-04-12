@@ -5,9 +5,35 @@ This repository exposes a stateful operator CLI in `main.py`.
 Use it as a saved toolbelt for the BitGN control plane and PCM runtime.
 The CLI persists local operator state in the path from `BITGN_STATE_PATH` or `.bitgn-run.json` by default.
 Completed trials are appended to `BITGN_JOURNAL_PATH` or `.bitgn-journal.jsonl` by default.
+Trial score payloads remain journaled for traceability but are not used as an operator decision signal.
 
 Normative execution rules live in `AGENTS.md`.
 For score-hidden competition operation, use `BLIND.md`.
+
+## Quick Start
+
+Single-worker `prod` run:
+
+```bash
+BITGN_API_KEY=... BENCHMARK_PROFILE=prod .venv/bin/python3 main.py resume --no-inspect
+```
+
+Parallel isolated trial workers:
+
+```bash
+BITGN_API_KEY=... BENCHMARK_PROFILE=prod \
+.venv/bin/python3 scripts/agent_runtime.py prepare --workers 4 --launch-start-trial
+```
+
+Recovery after interruption:
+
+```bash
+.venv/bin/python3 scripts/agent_runtime.py status
+.venv/bin/python3 scripts/agent_runtime.py next-pending --run-id <run_id>
+.venv/bin/python3 scripts/agent_runtime.py recover --run-id <run_id>
+```
+
+`recover` is read-only. Increment retry state only after a real relaunch via `mark-started`.
 
 ## Design note
 
@@ -29,7 +55,7 @@ Benchmark selection:
 
 - explicit override: `BENCHMARK_ID` or `BENCH_ID`
 - profile-based default: `BENCHMARK_PROFILE=dev|prod` or `PAC_PROFILE=dev|prod`
-- default profile: `dev`
+- default profile: `prod`
 
 Profile defaults:
 

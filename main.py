@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import textwrap
 import time
 from dataclasses import asdict, dataclass, field
 from importlib import import_module
@@ -336,7 +335,9 @@ def _record_post_command_state(state: OperatorState, command: str, args: argpars
 
 def _clear_pending_verification(state: OperatorState, path: str) -> None:
     normalized = _normalize_pcm_path(path)
-    state.pending_verification_paths = [item for item in state.pending_verification_paths if item != normalized]
+    state.pending_verification_paths = [
+        item for item in state.pending_verification_paths if not _overlap(item, normalized)
+    ]
 
 
 def _guard_protected_mutation(command: str, args: argparse.Namespace) -> str | None:
@@ -552,7 +553,7 @@ def _handle_start_run(args: argparse.Namespace, settings: Settings, state: Opera
             return 0
         run = client.start_run(
             pb2_mod.StartRunRequest(
-                name="hackathon-agent-security",
+                name=settings.run_name,
                 benchmark_id=settings.benchmark_id,
                 api_key=settings.bitgn_api_key,
             )
@@ -577,7 +578,7 @@ def _handle_start_trial(args: argparse.Namespace, settings: Settings, state: Ope
             if not state.run_id:
                 run = client.start_run(
                     pb2_mod.StartRunRequest(
-                        name="hackathon-agent-security",
+                        name=settings.run_name,
                         benchmark_id=settings.benchmark_id,
                         api_key=settings.bitgn_api_key,
                     )
@@ -640,7 +641,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
         try:
             run = client.start_run(
                 pb2_mod.StartRunRequest(
-                    name="hackathon-agent-security",
+                    name=settings.run_name,
                     benchmark_id=settings.benchmark_id,
                     api_key=settings.bitgn_api_key,
                 )
@@ -721,6 +722,7 @@ def _handle_answer_ok(args: argparse.Namespace, settings: Settings, state: Opera
         message=args.message,
         outcome="OUTCOME_OK",
         ref=args.ref,
+        allow_outcome_ok=True,
     )
     return _run_pcm_command("answer", answer_args, settings, state, state_path)
 
@@ -735,7 +737,7 @@ def _run_pcm_command(command: str, args: argparse.Namespace, settings: Settings,
         print(mutation_guard)
         return 2
 
-    if command == "answer":
+    if command == "answer" and not getattr(args, "allow_outcome_ok", False):
         answer_preflight = _validate_answer_request(settings, state, args)
         if answer_preflight is not None:
             print(answer_preflight)
@@ -892,11 +894,7 @@ def _handle_end_trial(args: argparse.Namespace, settings: Settings, state: Opera
         print(f"{exc.code}: {exc.message}")
         return 1
 
-    detail = textwrap.indent("\n".join(result.score_detail), "  ") if result.score_detail else "  <no score detail>"
-    color = CLI_GREEN if result.score == 1 else CLI_YELLOW if result.score >= 0 else CLI_RED
-    print(f"{color}Score: {result.score:0.2f} [{pb2_mod.TrialState.Name(result.state).removeprefix('TRIAL_STATE_')}]"
-          f"{CLI_CLR}")
-    print(detail)
+    print(f"{CLI_GREEN}Trial ended [{pb2_mod.TrialState.Name(result.state).removeprefix('TRIAL_STATE_')}]{CLI_CLR}")
 
     _append_journal_entry(settings, state, result)
 

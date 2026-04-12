@@ -17,6 +17,7 @@ class Settings:
     benchmark_profile: str
     bitgn_host: str
     benchmark_id: str
+    run_name: str
     bitgn_api_key: str
     state_path: str
     journal_path: str
@@ -31,11 +32,12 @@ def _default_benchmark_id(profile: str) -> str:
 
 
 def load_settings() -> Settings:
-    benchmark_profile = _env("BENCHMARK_PROFILE", "PAC_PROFILE", default="dev")
+    benchmark_profile = _env("BENCHMARK_PROFILE", "PAC_PROFILE", default="prod")
     return Settings(
         benchmark_profile=benchmark_profile,
         bitgn_host=_env("BENCHMARK_HOST", "BITGN_HOST", default="https://api.bitgn.com"),
         benchmark_id=_env("BENCHMARK_ID", "BENCH_ID", default=_default_benchmark_id(benchmark_profile)),
+        run_name=_env("BITGN_RUN_NAME", "RUN_NAME", default="https://t.me/ulanov_agents"),
         bitgn_api_key=_env("BITGN_API_KEY"),
         state_path=_env("BITGN_STATE_PATH", default=".bitgn-run.json"),
         journal_path=_env("BITGN_JOURNAL_PATH", default=".bitgn-journal.jsonl"),
