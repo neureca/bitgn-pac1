@@ -43,6 +43,14 @@ class OperatorState:
     pending_verification_paths: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ValidationReport:
+    kind: str
+    ok: bool
+    notes: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
 def _normalize_pcm_path(path: str) -> str:
     raw = (path or "").strip()
     if not raw or raw == "/":
@@ -303,6 +311,245 @@ def _pcm_parts(harness_url: str) -> tuple[Any, Any, Any]:
     return client, pb2_mod, errors_mod.ConnectError
 
 
+def _yaml_module() -> Any:
+    try:
+        return import_module("yaml")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing PyYAML. Run `uv sync` to install validator dependencies.") from exc
+
+
+def _read_runtime_file(settings: Settings, state: OperatorState, path: str) -> str:
+    normalized = _normalize_pcm_path(path)
+
+    def invoke(client: Any, pb2_mod: Any) -> Any:
+        return client.read(
+            pb2_mod.ReadRequest(
+                path=normalized,
+                number=False,
+                start_line=0,
+                end_line=0,
+            )
+        )
+
+    result = _pcm_call_with_retry(settings, state, invoke)
+    return str(result.content)
+
+
+def _looks_like_frontmatter_markdown(content: str) -> bool:
+    return content.startswith("---\n") or content.startswith("---\r\n")
+
+
+def _split_markdown_frontmatter(content: str) -> tuple[str, str]:
+    lines = content.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("Markdown file does not start with YAML frontmatter.")
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return "".join(lines[1:index]), "".join(lines[index + 1 :])
+    raise ValueError("Unterminated YAML frontmatter block.")
+
+
+def _validate_string_list(value: Any, field_name: str) -> list[str]:
+    if not isinstance(value, list):
+        return [f"`{field_name}` must be a list."]
+    errors: list[str] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, str) or not item.strip():
+            errors.append(f"`{field_name}[{index}]` must be a non-empty string.")
+    return errors
+
+
+def _validate_lines_field(lines: Any, field_name: str = "lines") -> list[str]:
+    if not isinstance(lines, list):
+        return [f"`{field_name}` must be a list."]
+    errors: list[str] = []
+    for index, item in enumerate(lines, start=1):
+        if not isinstance(item, dict):
+            errors.append(f"`{field_name}[{index}]` must be an object.")
+            continue
+        for required in ("item", "quantity", "unit_eur", "line_eur"):
+            if required not in item:
+                errors.append(f"`{field_name}[{index}]` is missing `{required}`.")
+        if "item" in item and (not isinstance(item["item"], str) or not item["item"].strip()):
+            errors.append(f"`{field_name}[{index}].item` must be a non-empty string.")
+        for numeric in ("quantity", "unit_eur", "line_eur"):
+            if numeric in item and (isinstance(item[numeric], bool) or not isinstance(item[numeric], (int, float))):
+                errors.append(f"`{field_name}[{index}].{numeric}` must be numeric.")
+    return errors
+
+
+def _validate_mapping_fields(data: dict[str, Any], required: list[str]) -> list[str]:
+    return [f"Missing required field `{field}`." for field in required if field not in data]
+
+
+def _is_nonempty_scalar(value: Any) -> bool:
+    if value is None or isinstance(value, (list, dict, tuple, set, bool)):
+        return False
+    return bool(str(value).strip())
+
+
+def _validate_inbound_email(data: dict[str, Any]) -> ValidationReport:
+    errors = _validate_mapping_fields(data, ["record_type", "from", "to", "subject", "received_at"])
+    if data.get("record_type") != "inbound_email":
+        errors.append("`record_type` must be `inbound_email`.")
+    if "from" in data and (not isinstance(data["from"], str) or not data["from"].strip()):
+        errors.append("`from` must be a non-empty string.")
+    if "subject" in data and (not isinstance(data["subject"], str) or not data["subject"].strip()):
+        errors.append("`subject` must be a non-empty string.")
+    if "received_at" in data and not _is_nonempty_scalar(data["received_at"]):
+        errors.append("`received_at` must be a non-empty scalar value.")
+    if "to" in data:
+        errors.extend(_validate_string_list(data["to"], "to"))
+    return ValidationReport(kind="inbound-email", ok=not errors, notes=["validated inbound_email frontmatter"], errors=errors)
+
+
+def _validate_outbound_email(data: dict[str, Any]) -> ValidationReport:
+    errors = _validate_mapping_fields(data, ["record_type", "created_at", "send_state", "to", "subject", "attachments"])
+    if data.get("record_type") != "outbound_email":
+        errors.append("`record_type` must be `outbound_email`.")
+    for field_name in ("send_state", "subject"):
+        if field_name in data and (not isinstance(data[field_name], str) or not data[field_name].strip()):
+            errors.append(f"`{field_name}` must be a non-empty string.")
+    if "created_at" in data and not _is_nonempty_scalar(data["created_at"]):
+        errors.append("`created_at` must be a non-empty scalar value.")
+    if "to" in data:
+        errors.extend(_validate_string_list(data["to"], "to"))
+    if "attachments" in data:
+        errors.extend(_validate_string_list(data["attachments"], "attachments"))
+    return ValidationReport(kind="outbound-email", ok=not errors, notes=["validated outbound_email frontmatter"], errors=errors)
+
+
+def _validate_invoice(data: dict[str, Any]) -> ValidationReport:
+    errors = _validate_mapping_fields(
+        data,
+        ["record_type", "invoice_number", "alias", "issued_on", "total_eur", "counterparty", "project", "lines"],
+    )
+    if data.get("record_type") != "invoice":
+        errors.append("`record_type` must be `invoice`.")
+    for field_name in ("invoice_number", "alias", "counterparty", "project"):
+        if field_name in data and (not isinstance(data[field_name], str) or not data[field_name].strip()):
+            errors.append(f"`{field_name}` must be a non-empty string.")
+    if "issued_on" in data and not _is_nonempty_scalar(data["issued_on"]):
+        errors.append("`issued_on` must be a non-empty scalar value.")
+    if "total_eur" in data and (isinstance(data["total_eur"], bool) or not isinstance(data["total_eur"], (int, float))):
+        errors.append("`total_eur` must be numeric.")
+    if "lines" in data:
+        errors.extend(_validate_lines_field(data["lines"]))
+    return ValidationReport(kind="invoice", ok=not errors, notes=["validated invoice frontmatter"], errors=errors)
+
+
+def _validate_bill(data: dict[str, Any]) -> ValidationReport:
+    errors = _validate_mapping_fields(
+        data,
+        ["record_type", "bill_id", "alias", "purchased_on", "total_eur", "counterparty", "project", "lines"],
+    )
+    if data.get("record_type") != "bill":
+        errors.append("`record_type` must be `bill`.")
+    for field_name in ("bill_id", "alias", "counterparty", "project"):
+        if field_name in data and (not isinstance(data[field_name], str) or not data[field_name].strip()):
+            errors.append(f"`{field_name}` must be a non-empty string.")
+    if "purchased_on" in data and not _is_nonempty_scalar(data["purchased_on"]):
+        errors.append("`purchased_on` must be a non-empty scalar value.")
+    if "total_eur" in data and (isinstance(data["total_eur"], bool) or not isinstance(data["total_eur"], (int, float))):
+        errors.append("`total_eur` must be numeric.")
+    if "lines" in data:
+        errors.extend(_validate_lines_field(data["lines"]))
+    return ValidationReport(kind="bill", ok=not errors, notes=["validated bill frontmatter"], errors=errors)
+
+
+def _validate_frontmatter_content(content: str, kind: str) -> ValidationReport:
+    try:
+        frontmatter_text, _body = _split_markdown_frontmatter(content)
+    except ValueError as exc:
+        return ValidationReport(kind=kind, ok=False, errors=[str(exc)])
+
+    yaml_mod = _yaml_module()
+    try:
+        payload = yaml_mod.safe_load(frontmatter_text) if frontmatter_text.strip() else {}
+    except yaml_mod.YAMLError as exc:
+        return ValidationReport(kind=kind, ok=False, errors=[f"Invalid YAML frontmatter: {exc}"])
+
+    if not isinstance(payload, dict):
+        return ValidationReport(kind=kind, ok=False, errors=["Frontmatter must parse to a mapping/object."])
+
+    record_type = str(payload.get("record_type") or "").strip()
+    if kind == "inbound-email":
+        return _validate_inbound_email(payload)
+    if kind == "outbound-email":
+        return _validate_outbound_email(payload)
+    if kind == "finance-record":
+        if record_type == "invoice":
+            return _validate_invoice(payload)
+        if record_type == "bill":
+            return _validate_bill(payload)
+        return ValidationReport(kind=kind, ok=False, errors=["Finance record frontmatter must have `record_type` of `invoice` or `bill`."])
+    if kind == "frontmatter":
+        if record_type == "inbound_email":
+            return _validate_inbound_email(payload)
+        if record_type == "outbound_email":
+            return _validate_outbound_email(payload)
+        if record_type == "invoice":
+            return _validate_invoice(payload)
+        if record_type == "bill":
+            return _validate_bill(payload)
+        return ValidationReport(
+            kind=kind,
+            ok=True,
+            notes=["frontmatter parsed successfully", f"record_type={record_type or '<none>'}"],
+        )
+    return ValidationReport(kind=kind, ok=False, errors=[f"Unsupported frontmatter validation kind: {kind}"])
+
+
+def _detect_validation_kind(path: str, content: str) -> str:
+    suffix = PurePosixPath(_normalize_pcm_path(path)).suffix.lower()
+    if suffix == ".json":
+        return "json"
+    if suffix == ".jsonl":
+        return "jsonl"
+    if suffix in {".yaml", ".yml"}:
+        return "yaml"
+    if suffix == ".md" and _looks_like_frontmatter_markdown(content):
+        return "frontmatter"
+    raise ValueError("Could not auto-detect a supported machine-readable format for this path.")
+
+
+def _validate_content(path: str, content: str, kind: str) -> ValidationReport:
+    resolved_kind = _detect_validation_kind(path, content) if kind == "auto" else kind
+
+    if resolved_kind == "json":
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as exc:
+            return ValidationReport(kind=resolved_kind, ok=False, errors=[f"Invalid JSON: {exc}"])
+        return ValidationReport(kind=resolved_kind, ok=True, notes=["JSON parsed successfully"])
+
+    if resolved_kind == "jsonl":
+        errors: list[str] = []
+        count = 0
+        for index, line in enumerate(content.splitlines(), start=1):
+            if not line.strip():
+                continue
+            count += 1
+            try:
+                json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(f"Line {index}: invalid JSON: {exc}")
+        return ValidationReport(kind=resolved_kind, ok=not errors, notes=[f"validated {count} JSONL line(s)"], errors=errors)
+
+    if resolved_kind == "yaml":
+        yaml_mod = _yaml_module()
+        try:
+            yaml_mod.safe_load(content)
+        except yaml_mod.YAMLError as exc:
+            return ValidationReport(kind=resolved_kind, ok=False, errors=[f"Invalid YAML: {exc}"])
+        return ValidationReport(kind=resolved_kind, ok=True, notes=["YAML parsed successfully"])
+
+    if resolved_kind in {"frontmatter", "inbound-email", "outbound-email", "finance-record"}:
+        return _validate_frontmatter_content(content, resolved_kind)
+
+    return ValidationReport(kind=resolved_kind, ok=False, errors=[f"Unsupported validation kind: {resolved_kind}"])
+
+
 def _pick_next_trial(run: Any, trial_state_enum: Any) -> Any | None:
     for trial in run.trials:
         if trial.state != trial_state_enum.TRIAL_STATE_DONE:
@@ -556,8 +803,31 @@ def _handle_preanswer(settings: Settings, state: OperatorState) -> int:
     else:
         print("- pending verification paths: none")
     print("- for OUTCOME_OK: refs should cover identity plus final value path")
+    print("- for schema-shaped outputs: run `uv run python3 main.py validate /path` before OUTCOME_OK")
     print("- for ambiguous or unsafe tasks: use the appropriate non-OK outcome")
     return 0
+
+
+def _handle_validate(args: argparse.Namespace, settings: Settings, state: OperatorState) -> int:
+    missing_trial = _ensure_active_trial(state)
+    if missing_trial is not None:
+        return missing_trial
+
+    normalized = _normalize_pcm_path(args.path)
+    try:
+        content = _read_runtime_file(settings, state, normalized)
+        report = _validate_content(normalized, content, args.kind)
+    except Exception as exc:
+        print(str(exc))
+        return 1
+
+    status = f"{CLI_GREEN}VALID{CLI_CLR}" if report.ok else f"{CLI_RED}INVALID{CLI_CLR}"
+    print(f"{status} {normalized} [kind={report.kind}]")
+    for note in report.notes:
+        print(f"- {note}")
+    for error in report.errors:
+        print(f"- {error}")
+    return 0 if report.ok else 1
 
 
 def _handle_status(args: argparse.Namespace, settings: Settings, state: OperatorState) -> int:
@@ -995,6 +1265,16 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--level", type=int, default=2, help="Tree depth when verifying a directory")
     verify_parser.set_defaults(handler="verify")
 
+    validate_parser = subparsers.add_parser("validate", help="Validate a machine-readable runtime file")
+    validate_parser.add_argument("path", help="PCM path to validate")
+    validate_parser.add_argument(
+        "--kind",
+        choices=["auto", "json", "jsonl", "yaml", "frontmatter", "inbound-email", "outbound-email", "finance-record"],
+        default="auto",
+        help="Validation mode",
+    )
+    validate_parser.set_defaults(handler="validate")
+
     end_trial_parser = subparsers.add_parser("end-trial", help="End the active trial after answer")
     end_trial_parser.add_argument("trial_id", nargs="?", help="Explicit trial id; defaults to saved active trial")
     end_trial_parser.add_argument(
@@ -1112,6 +1392,7 @@ def main() -> int:
         "preanswer",
         "inspect",
         "verify",
+        "validate",
         "end-trial",
         "context",
         "tree",
@@ -1149,6 +1430,8 @@ def main() -> int:
             return _handle_inspect(args, settings, state, state_path)
         if args.handler == "verify":
             return _handle_verify(args, settings, state, state_path)
+        if args.handler == "validate":
+            return _handle_validate(args, settings, state)
         if args.handler == "end-trial":
             return _handle_end_trial(args, settings, state, state_path)
         if args.handler == "answer-ok":
