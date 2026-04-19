@@ -192,13 +192,11 @@ End the active trial after `answer`.
 ```bash
 uv run python3 main.py end-trial
 uv run python3 main.py end-trial vm-123
-uv run python3 main.py end-trial --allow-unanswered
 ```
 
 Arguments:
 
 - optional `trial_id`: explicitly end that trial
-- `--allow-unanswered`: bypass the answer-first guard only for a diagnosed blocker
 
 ### `session`
 

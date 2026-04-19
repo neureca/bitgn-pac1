@@ -1197,9 +1197,9 @@ def _handle_end_trial(args: argparse.Namespace, settings: Settings, state: Opera
             "Start that trial in this session first or clear the current session."
         )
         return 2
-    if not state.answer_sent and not args.allow_unanswered:
+    if not state.answer_sent:
         print("Refusing to end trial before answer.")
-        print("Send `uv run python3 main.py answer ...` first or use `uv run python3 main.py end-trial --allow-unanswered`.")
+        print("Send `uv run python3 main.py answer ...` first.")
         return 2
 
     client, pb2_mod, connect_error = _harness_parts(settings)
@@ -1277,11 +1277,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     end_trial_parser = subparsers.add_parser("end-trial", help="End the active trial after answer")
     end_trial_parser.add_argument("trial_id", nargs="?", help="Explicit trial id; defaults to saved active trial")
-    end_trial_parser.add_argument(
-        "--allow-unanswered",
-        action="store_true",
-        help="Allow end_trial without a prior answer when you intentionally stop on a diagnosed blocker",
-    )
     end_trial_parser.set_defaults(handler="end-trial")
 
     context_parser = subparsers.add_parser("context", help="PCM context")
