@@ -304,7 +304,7 @@ Planning is required only when:
 Semantic state ownership:
 
 - `interpret(...)` is the primary owner of `signals`, `obligations`, and `blockers`
-- `validate_result(...)` may update semantic state after execution, including `O8 execution_verified`
+- `validate_result(...)` may update only post-action semantic conclusions after execution, including `O8 execution_verified` and validation-derived blockers or risk signals
 - `decide_transition(...)` reads semantic state but does not derive it
 - `adapter_close(...)` must not change domain obligations or blockers
 
@@ -500,11 +500,13 @@ while runtime_state.ended != true:
 Skeleton constraints:
 
 - no step mutates shared state directly
-- `interpret` is the single semantic update step for `signals`, `obligations`, and `blockers`
+- `interpret` is the primary pre-action semantic update step for `signals`, `obligations`, and `blockers`
+- `validate_result` may update only post-action semantic conclusions derived from the executed action
 - `decide_transition` is the only public layer that selects a terminal
 - `plan_action` only builds `planned_action`
 - `execute_action` only executes the planned action
-- `validate_result` only validates the executed effect
+- `validate_result` only validates the executed effect and any required machine-readable artifact correctness
+- `validate_result` must not re-evaluate pre-action admissibility such as authority, target selection, or task-constraint conjunction
 - once `selected_terminal != null`, the orchestrator is in closure mode
 - `adapter_close` must distinguish retryable close failure from fatal close failure
 - fatal close failure must be recorded in `RuntimeState.close_failure`

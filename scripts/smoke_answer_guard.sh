@@ -28,8 +28,7 @@ cat >"$STATE_FILE" <<'JSON'
 JSON
 
 echo "== answer should be blocked before network =="
-if BITGN_STATE_PATH="$STATE_FILE" BENCHMARK_PROFILE=prod "${PYTHON_CMD[@]}" main.py answer \
-  --outcome OUTCOME_OK \
+if BITGN_STATE_PATH="$STATE_FILE" BENCHMARK_PROFILE=prod "${PYTHON_CMD[@]}" main.py answer-ok \
   --message "Updated /docs/todo.txt" \
   --ref /docs/todo.txt; then
   echo "Expected answer guard to block, but command succeeded"

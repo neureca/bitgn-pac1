@@ -1,6 +1,7 @@
 __pycache__/
 scripts/__pycache__/
 .venv/
+.DS_Store
 
 .bitgn-run.json
 .bitgn-journal.jsonl

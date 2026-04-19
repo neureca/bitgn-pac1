@@ -58,7 +58,10 @@ def _write_runtime_env(base_dir: Path, settings) -> Path:
     env_path = base_dir / "runtime.env"
     content = (
         f"BITGN_API_KEY={settings.bitgn_api_key}\n"
+        f"BENCHMARK_HOST={settings.bitgn_host}\n"
         f"BENCHMARK_PROFILE={settings.benchmark_profile}\n"
+        f"BENCHMARK_ID={settings.benchmark_id}\n"
+        f"BITGN_MIN_OK_REFS={settings.min_ok_refs}\n"
     )
     env_path.write_text(content)
     env_path.chmod(0o600)

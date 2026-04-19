@@ -247,7 +247,27 @@ Arguments:
 
 Note:
 
-- `verify` is the command that clears pending mutation verification for `answer`
+- `verify` is the lifecycle verification step that clears pending mutation verification for `answer`
+
+### `validate`
+
+Validate a machine-readable or schema-shaped runtime file.
+
+```bash
+uv run python3 main.py validate /docs/outbound.jsonl
+uv run python3 main.py validate /inbox/email.md --kind outbound_email
+```
+
+Arguments:
+
+- `path`: path to validate
+- `--kind`: explicit validation kind when auto-detection is not enough
+
+Note:
+
+- `validate` checks artifact correctness with the corresponding machine interpretation
+- `validate` does not clear pending mutation verification by itself
+- if the path was mutated and must support `answer`, run `validate /path` first and then `verify /path`
 
 ## PCM runtime commands
 

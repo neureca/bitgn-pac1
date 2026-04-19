@@ -79,6 +79,18 @@ def _command_paths(command: str, args: argparse.Namespace) -> list[str]:
     if command == "move":
         return [_normalize_pcm_path(args.from_name), _normalize_pcm_path(args.to_name)]
     return []
+def _move_verification_anchor(from_path: str, to_path: str) -> str:
+    left_parts = PurePosixPath(_normalize_pcm_path(from_path)).parts
+    right_parts = PurePosixPath(_normalize_pcm_path(to_path)).parts
+    shared: list[str] = []
+    for left, right in zip(left_parts, right_parts):
+        if left != right:
+            break
+        shared.append(left)
+    if not shared:
+        return "/"
+    anchor = PurePosixPath(*shared).as_posix()
+    return anchor or "/"
 
 
 def _is_mutating_command(command: str) -> bool:
@@ -575,11 +587,14 @@ def _ensure_active_trial(state: OperatorState) -> int | None:
 
 
 def _record_post_command_state(state: OperatorState, command: str, args: argparse.Namespace) -> None:
-    paths = _command_paths(command, args)
-    if _is_mutating_command(command):
-        current = {_normalize_pcm_path(path) for path in state.pending_verification_paths}
-        current.update(paths)
-        state.pending_verification_paths = sorted(current)
+    if not _is_mutating_command(command):
+        return
+    current = {_normalize_pcm_path(path) for path in state.pending_verification_paths}
+    if command == "move":
+        current.add(_move_verification_anchor(args.from_name, args.to_name))
+    else:
+        current.update(_command_paths(command, args))
+    state.pending_verification_paths = sorted(current)
 
 
 def _clear_pending_verification(state: OperatorState, path: str) -> None:
@@ -728,6 +743,28 @@ def _path_kind_guess(path: str) -> str:
     return "unknown"
 
 
+def _detect_runtime_verify_kind(settings: Settings, state: OperatorState, path: str) -> str:
+    normalized = _normalize_pcm_path(path)
+
+    def _try_list() -> bool:
+        try:
+            def invoke(client: Any, pb2_mod: Any) -> Any:
+                return client.list(pb2_mod.ListRequest(name=normalized))
+
+            _pcm_call_with_retry(settings, state, invoke)
+            return True
+        except Exception:
+            return False
+
+    if _try_list():
+        return "dir"
+    try:
+        _read_runtime_file(settings, state, normalized)
+        return "file"
+    except Exception:
+        return _path_kind_guess(normalized)
+
+
 def _append_journal_entry(settings: Settings, state: OperatorState, result: Any) -> None:
     payload = {
         "ts": int(time.time()),
@@ -803,7 +840,7 @@ def _handle_preanswer(settings: Settings, state: OperatorState) -> int:
     else:
         print("- pending verification paths: none")
     print("- for OUTCOME_OK: refs should cover identity plus final value path")
-    print("- for schema-shaped outputs: run `uv run python3 main.py validate /path` before OUTCOME_OK")
+    print("- for schema-shaped outputs: `validate /path`, then `verify /path`")
     print("- for ambiguous or unsafe tasks: use the appropriate non-OK outcome")
     return 0
 
@@ -1163,7 +1200,7 @@ def _handle_verify(args: argparse.Namespace, settings: Settings, state: Operator
     normalized = _normalize_pcm_path(args.path)
     kind = args.kind
     if kind == "auto":
-        kind = _path_kind_guess(normalized)
+        kind = _detect_runtime_verify_kind(settings, state, normalized)
     commands: list[tuple[str, argparse.Namespace]]
     if kind == "file":
         commands = [("read", argparse.Namespace(path=normalized, number=False, start_line=0, end_line=0))]
