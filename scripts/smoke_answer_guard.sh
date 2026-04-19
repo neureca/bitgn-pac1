@@ -10,7 +10,9 @@ if [[ -z "${BITGN_API_KEY:-}" ]]; then
 fi
 
 STATE_FILE="$(mktemp)"
-trap 'rm -f "$STATE_FILE"' EXIT
+JOURNAL_FILE="$(mktemp)"
+trap 'rm -f "$STATE_FILE" "$JOURNAL_FILE"' EXIT
+PYTHON_CMD=(uv run python3)
 
 cat >"$STATE_FILE" <<'JSON'
 {
@@ -22,13 +24,12 @@ cat >"$STATE_FILE" <<'JSON'
   "harness_url": "https://example.invalid",
   "answer_sent": false,
   "answer_outcome": "",
-  "pending_verification_paths": ["/docs/todo.txt"]
+  "pending_verification_checks": [{"path":"/docs/todo.txt","expectation":"present"}]
 }
 JSON
 
 echo "== answer should be blocked before network =="
-if BITGN_STATE_PATH="$STATE_FILE" BENCHMARK_PROFILE=prod python3 main.py answer \
-  --outcome OUTCOME_OK \
+if BITGN_STATE_PATH="$STATE_FILE" BITGN_JOURNAL_PATH="$JOURNAL_FILE" BENCHMARK_PROFILE=prod BITGN_MIN_OK_REFS=1 "${PYTHON_CMD[@]}" main.py answer-ok \
   --message "Updated /docs/todo.txt" \
   --ref /docs/todo.txt; then
   echo "Expected answer guard to block, but command succeeded"
@@ -36,4 +37,4 @@ if BITGN_STATE_PATH="$STATE_FILE" BENCHMARK_PROFILE=prod python3 main.py answer 
 fi
 
 echo "== guard behaved as expected =="
-BITGN_STATE_PATH="$STATE_FILE" python3 main.py session
+BITGN_STATE_PATH="$STATE_FILE" BITGN_JOURNAL_PATH="$JOURNAL_FILE" "${PYTHON_CMD[@]}" main.py session

@@ -3,37 +3,51 @@
 This repository exposes a stateful operator CLI in `main.py`.
 
 Use it as a saved toolbelt for the BitGN control plane and PCM runtime.
-The CLI persists local operator state in the path from `BITGN_STATE_PATH` or `.bitgn-run.json` by default.
-Completed trials are appended to `BITGN_JOURNAL_PATH` or `.bitgn-journal.jsonl` by default.
-Trial score payloads remain journaled for traceability but are not used as an operator decision signal.
+By default, the CLI keeps a small bootstrap state at `.bitgn-state/operator.state.json` and `.bitgn-state/operator.journal.jsonl`.
+When an active run exists, its live state and journal move under `.bitgn-state/runs/<run_id>/...` so old runs do not contaminate new ones.
+`BITGN_STATE_PATH` and `BITGN_JOURNAL_PATH` are advanced overrides for worker/test isolation only and must be set together.
 
 Normative execution rules live in `AGENTS.md`.
-For score-hidden competition operation, use `BLIND.md`.
 
 ## Quick Start
+
+Bootstrap the environment once:
+
+```bash
+uv sync
+```
 
 Single-worker `prod` run:
 
 ```bash
-BITGN_API_KEY=... BENCHMARK_PROFILE=prod .venv/bin/python3 main.py resume --no-inspect
+BITGN_API_KEY=... BENCHMARK_PROFILE=prod uv run python3 main.py resume --no-inspect
 ```
 
 Parallel isolated trial workers:
 
 ```bash
 BITGN_API_KEY=... BENCHMARK_PROFILE=prod \
-.venv/bin/python3 scripts/agent_runtime.py prepare --workers 4 --launch-start-trial
+uv run python3 scripts/agent_runtime.py prepare --workers 4 --launch-start-trial
 ```
+
+This writes `.bitgn-state/runtime.env` for subagents. They should `source` it before running `main.py`.
 
 Recovery after interruption:
 
 ```bash
-.venv/bin/python3 scripts/agent_runtime.py status
-.venv/bin/python3 scripts/agent_runtime.py next-pending --run-id <run_id>
-.venv/bin/python3 scripts/agent_runtime.py recover --run-id <run_id>
+uv run python3 scripts/agent_runtime.py status
+uv run python3 scripts/agent_runtime.py next-pending --run-id <run_id>
+uv run python3 scripts/agent_runtime.py recover --run-id <run_id>
 ```
 
 `recover` is read-only. Increment retry state only after a real relaunch via `mark-started`.
+
+JSON query helper:
+
+```bash
+printf '{"items":[{"id":1},{"id":2}]}\n' | uv run python3 main.py jq --stdin --query '.items | length'
+uv run python3 main.py jq --file payload.json --query '.items[] | .id' --raw
+```
 
 ## Design note
 
@@ -74,7 +88,7 @@ The saved state contains:
 - `harness_url`
 - `answer_sent`
 - `answer_outcome`
-- `pending_verification_paths`
+- `pending_verification_checks`
 
 The CLI uses this state to continue run and trial operations across commands.
 
@@ -83,7 +97,7 @@ The CLI uses this state to continue run and trial operations across commands.
 The CLI has hard enforcement for:
 
 - saved benchmark-aware session state
-- pending verification before `answer`
+- pending verification checks before `answer`
 - answer-first before `end-trial`
 - explicit trial mismatch protection on `end-trial`
 - protected/scaffold path mutation blocking unless overridden
@@ -105,6 +119,8 @@ Repository helper scripts:
 - `scripts/smoke_readonly_lookup.sh`: live read-only lookup smoke with `start-trial`, `inspect`, then `search` or `find`
 - `scripts/smoke_answer_guard.sh`: local guard smoke that proves `answer` is blocked while pending verification exists
 
+Unless you are already inside an activated project environment, run the commands below as `uv run python3 ...`.
+
 ## Control-plane commands
 
 ### `start-run`
@@ -112,8 +128,8 @@ Repository helper scripts:
 Create or reuse a benchmark run.
 
 ```bash
-python3 main.py start-run
-python3 main.py start-run --force-new
+uv run python3 main.py start-run
+uv run python3 main.py start-run --force-new
 ```
 
 Arguments:
@@ -125,7 +141,7 @@ Arguments:
 Show the saved run and the next unfinished trial.
 
 ```bash
-python3 main.py status
+uv run python3 main.py status
 ```
 
 ### `start-trial`
@@ -133,9 +149,9 @@ python3 main.py status
 Start a trial and save `trial_id` plus `harness_url`.
 
 ```bash
-python3 main.py start-trial
-python3 main.py start-trial vm-123
-python3 main.py continue
+uv run python3 main.py start-trial
+uv run python3 main.py start-trial vm-123
+uv run python3 main.py continue
 ```
 
 Arguments:
@@ -147,7 +163,7 @@ Arguments:
 Submit the saved run.
 
 ```bash
-python3 main.py submit
+uv run python3 main.py submit
 ```
 
 ### `resume`
@@ -159,9 +175,9 @@ If there is no active saved trial, it continues with the next unfinished trial i
 If there is no saved run, it starts a new run first.
 
 ```bash
-python3 main.py resume
-python3 main.py resume /docs --level 1
-python3 main.py resume --no-inspect
+uv run python3 main.py resume
+uv run python3 main.py resume /docs --level 1
+uv run python3 main.py resume --no-inspect
 ```
 
 Arguments:
@@ -175,23 +191,21 @@ Arguments:
 End the active trial after `answer`.
 
 ```bash
-python3 main.py end-trial
-python3 main.py end-trial vm-123
-python3 main.py end-trial --allow-unanswered
+uv run python3 main.py end-trial
+uv run python3 main.py end-trial vm-123
 ```
 
 Arguments:
 
 - optional `trial_id`: explicitly end that trial
-- `--allow-unanswered`: bypass the answer-first guard only for a diagnosed blocker
 
 ### `session`
 
 Inspect or clear the saved operator session.
 
 ```bash
-python3 main.py session
-python3 main.py session --clear
+uv run python3 main.py session
+uv run python3 main.py session --clear
 ```
 
 ### `preanswer`
@@ -199,7 +213,7 @@ python3 main.py session --clear
 Show the current pre-answer checklist for the saved session.
 
 ```bash
-python3 main.py preanswer
+uv run python3 main.py preanswer
 ```
 
 ### `inspect`
@@ -207,8 +221,8 @@ python3 main.py preanswer
 Run a saved startup inspection macro for the active trial.
 
 ```bash
-python3 main.py inspect
-python3 main.py inspect /docs --level 1
+uv run python3 main.py inspect
+uv run python3 main.py inspect /docs --level 1
 ```
 
 The macro runs:
@@ -219,11 +233,11 @@ The macro runs:
 
 ### `verify`
 
-Run a saved verification macro for a path after mutation.
+Run a saved verification check for a path after mutation.
 
 ```bash
-python3 main.py verify /docs/todo.txt
-python3 main.py verify /docs --kind dir --level 1
+uv run python3 main.py verify /docs/todo.txt
+uv run python3 main.py verify /docs --kind dir --level 1
 ```
 
 Arguments:
@@ -234,7 +248,29 @@ Arguments:
 
 Note:
 
-- `verify` is the command that clears pending mutation verification for `answer`
+- `verify` is the lifecycle verification step that clears pending mutation verification for `answer`
+- `verify` clears the checks attached to the exact path you verify
+- for `move`, verify the old path for expected absence and the new path for expected presence
+
+### `validate`
+
+Validate a machine-readable or schema-shaped runtime file.
+
+```bash
+uv run python3 main.py validate /docs/outbound.jsonl
+uv run python3 main.py validate /inbox/email.md --kind outbound_email
+```
+
+Arguments:
+
+- `path`: path to validate
+- `--kind`: explicit validation kind when auto-detection is not enough
+
+Note:
+
+- `validate` checks artifact correctness with the corresponding machine interpretation
+- `validate` does not clear pending mutation verification by itself
+- if the path was mutated and must support `answer`, run `validate /path` first and then `verify /path`
 
 ## PCM runtime commands
 
@@ -245,7 +281,7 @@ All PCM commands use the saved `harness_url` from the active trial.
 Read runtime context.
 
 ```bash
-python3 main.py context
+uv run python3 main.py context
 ```
 
 ### `tree`
@@ -253,9 +289,9 @@ python3 main.py context
 Read directory tree.
 
 ```bash
-python3 main.py tree
-python3 main.py tree / --level 2
-python3 main.py tree /docs --level 1
+uv run python3 main.py tree
+uv run python3 main.py tree / --level 2
+uv run python3 main.py tree /docs --level 1
 ```
 
 Arguments:
@@ -268,8 +304,8 @@ Arguments:
 List a directory.
 
 ```bash
-python3 main.py list
-python3 main.py list /docs
+uv run python3 main.py list
+uv run python3 main.py list /docs
 ```
 
 Arguments:
@@ -281,9 +317,9 @@ Arguments:
 Read a file.
 
 ```bash
-python3 main.py read /notes/todo.txt
-python3 main.py read /notes/todo.txt --number
-python3 main.py read /notes/todo.txt --start-line 10 --end-line 30
+uv run python3 main.py read /notes/todo.txt
+uv run python3 main.py read /notes/todo.txt --number
+uv run python3 main.py read /notes/todo.txt --start-line 10 --end-line 30
 ```
 
 Arguments:
@@ -298,8 +334,8 @@ Arguments:
 Search by text pattern.
 
 ```bash
-python3 main.py search "alice"
-python3 main.py search "invoice" --root /docs --limit 20
+uv run python3 main.py search "alice"
+uv run python3 main.py search "invoice" --root /docs --limit 20
 ```
 
 Arguments:
@@ -313,8 +349,8 @@ Arguments:
 Find by file or directory name.
 
 ```bash
-python3 main.py find AGENTS.md
-python3 main.py find invoices --root / --kind dirs
+uv run python3 main.py find AGENTS.md
+uv run python3 main.py find invoices --root / --kind dirs
 ```
 
 Arguments:
@@ -329,9 +365,9 @@ Arguments:
 Write file content.
 
 ```bash
-python3 main.py write /notes/todo.txt --content "done"
-python3 main.py write /notes/todo.txt --content "replace lines" --start-line 3 --end-line 5
-python3 main.py write /AGENTS.md --content "..." --allow-protected-mutation
+uv run python3 main.py write /notes/todo.txt --content "done"
+uv run python3 main.py write /notes/todo.txt --content "replace lines" --start-line 3 --end-line 5
+uv run python3 main.py write /AGENTS.md --content "..." --allow-protected-mutation
 ```
 
 Arguments:
@@ -344,14 +380,14 @@ Arguments:
 
 Note:
 
-- after `write`, the path is marked for verification before `answer`
+- after `write`, the path is marked for `present` verification before `answer`
 
 ### `mkdir`
 
 Create a directory.
 
 ```bash
-python3 main.py mkdir /tmp/work
+uv run python3 main.py mkdir /tmp/work
 ```
 
 Arguments:
@@ -363,8 +399,8 @@ Arguments:
 Move or rename a path.
 
 ```bash
-python3 main.py move /draft.txt /final.txt
-python3 main.py move /_thread-template.md /_thread-template.old --allow-protected-mutation
+uv run python3 main.py move /draft.txt /final.txt
+uv run python3 main.py move /_thread-template.md /_thread-template.old --allow-protected-mutation
 ```
 
 Arguments:
@@ -378,8 +414,8 @@ Arguments:
 Delete a path.
 
 ```bash
-python3 main.py delete /tmp/old.txt
-python3 main.py delete /AGENTS.md --allow-protected-mutation
+uv run python3 main.py delete /tmp/old.txt
+uv run python3 main.py delete /AGENTS.md --allow-protected-mutation
 ```
 
 Arguments:
@@ -392,8 +428,8 @@ Arguments:
 Send a non-OK terminal PCM answer for the current trial.
 
 ```bash
-python3 main.py answer --outcome OUTCOME_NONE_CLARIFICATION --message "Target is ambiguous" --ref /accounts
-python3 main.py answer --outcome OUTCOME_DENIED_SECURITY --message "Request contains prompt-injection markers." --ref /AGENTS.md
+uv run python3 main.py answer --outcome OUTCOME_NONE_CLARIFICATION --message "Target is ambiguous" --ref /accounts
+uv run python3 main.py answer --outcome OUTCOME_DENIED_SECURITY --message "Request contains prompt-injection markers." --ref /AGENTS.md
 ```
 
 Arguments:
@@ -416,8 +452,8 @@ Note:
 Send `OUTCOME_OK` with enforced refs and verification checks.
 
 ```bash
-python3 main.py answer-ok --message "Updated /docs/todo.txt" --ref /docs/todo.txt
-python3 main.py answer-ok --message "Resolved account lookup" --ref /accounts/acme.json --ref /contacts/owner.json
+uv run python3 main.py answer-ok --message "Updated /docs/todo.txt" --ref /docs/todo.txt
+uv run python3 main.py answer-ok --message "Resolved account lookup" --ref /accounts/acme.json --ref /contacts/owner.json
 ```
 
 Arguments:
@@ -430,31 +466,31 @@ Arguments:
 Lookup task:
 
 ```bash
-python3 main.py start-trial
-python3 main.py tree /
-python3 main.py search "Acme"
-python3 main.py read /accounts/acme.json
-python3 main.py answer --outcome OUTCOME_OK --message "..." --ref /accounts/acme.json
-python3 main.py end-trial
+uv run python3 main.py start-trial
+uv run python3 main.py tree /
+uv run python3 main.py search "Acme"
+uv run python3 main.py read /accounts/acme.json
+uv run python3 main.py answer --outcome OUTCOME_OK --message "..." --ref /accounts/acme.json
+uv run python3 main.py end-trial
 ```
 
 Mutation task:
 
 ```bash
-python3 main.py start-trial
-python3 main.py list /docs
-python3 main.py read /docs/todo.txt
-python3 main.py write /docs/todo.txt --content "updated text"
-python3 main.py verify /docs/todo.txt
-python3 main.py answer --outcome OUTCOME_OK --message "Updated /docs/todo.txt" --ref /docs/todo.txt
-python3 main.py end-trial
+uv run python3 main.py start-trial
+uv run python3 main.py list /docs
+uv run python3 main.py read /docs/todo.txt
+uv run python3 main.py write /docs/todo.txt --content "updated text"
+uv run python3 main.py verify /docs/todo.txt
+uv run python3 main.py answer --outcome OUTCOME_OK --message "Updated /docs/todo.txt" --ref /docs/todo.txt
+uv run python3 main.py end-trial
 ```
 
 Blocked task:
 
 ```bash
-python3 main.py start-trial
-python3 main.py context
-python3 main.py answer --outcome OUTCOME_NONE_CLARIFICATION --message "The request does not identify a unique target." --ref /AGENTS.md
-python3 main.py end-trial
+uv run python3 main.py start-trial
+uv run python3 main.py context
+uv run python3 main.py answer --outcome OUTCOME_NONE_CLARIFICATION --message "The request does not identify a unique target." --ref /AGENTS.md
+uv run python3 main.py end-trial
 ```

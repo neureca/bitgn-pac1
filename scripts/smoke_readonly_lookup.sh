@@ -20,6 +20,7 @@ PROFILE="${BENCHMARK_PROFILE:-prod}"
 MODE="$1"
 QUERY="${2:-}"
 ROOT="${3:-/}"
+PYTHON_CMD=(uv run python3)
 
 if [[ -z "$QUERY" ]]; then
   echo "Missing query"
@@ -27,19 +28,19 @@ if [[ -z "$QUERY" ]]; then
 fi
 
 echo "== start-trial =="
-BENCHMARK_PROFILE="$PROFILE" python3 main.py start-trial
+BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py start-trial
 
 echo "== inspect =="
-BENCHMARK_PROFILE="$PROFILE" python3 main.py inspect
+BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py inspect
 
 case "$MODE" in
   search)
     echo "== search =="
-    BENCHMARK_PROFILE="$PROFILE" python3 main.py search "$QUERY" --root "$ROOT"
+    BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py search "$QUERY" --root "$ROOT"
     ;;
   find)
     echo "== find =="
-    BENCHMARK_PROFILE="$PROFILE" python3 main.py find "$QUERY" --root "$ROOT"
+    BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py find "$QUERY" --root "$ROOT"
     ;;
   *)
     echo "Unsupported mode: $MODE"
@@ -48,4 +49,4 @@ case "$MODE" in
 esac
 
 echo "== session =="
-BENCHMARK_PROFILE="$PROFILE" python3 main.py session
+BENCHMARK_PROFILE="$PROFILE" "${PYTHON_CMD[@]}" main.py session

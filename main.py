@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -38,7 +40,15 @@ class OperatorState:
     harness_url: str = ""
     answer_sent: bool = False
     answer_outcome: str = ""
-    pending_verification_paths: list[str] = field(default_factory=list)
+    pending_verification_checks: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class ValidationReport:
+    kind: str
+    ok: bool
+    notes: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 def _normalize_pcm_path(path: str) -> str:
@@ -120,9 +130,25 @@ def _load_state(state_path: Path) -> OperatorState:
         return OperatorState(run_id=str(payload.get("run_id") or ""))
     if not isinstance(payload, dict):
         return OperatorState()
-    pending = payload.get("pending_verification_paths", [])
-    if not isinstance(pending, list):
-        pending = []
+    pending_checks_raw = payload.get("pending_verification_checks")
+    pending_checks: list[dict[str, str]] = []
+    if isinstance(pending_checks_raw, list):
+        for item in pending_checks_raw:
+            if not isinstance(item, dict):
+                continue
+            path = _normalize_pcm_path(str(item.get("path") or ""))
+            expectation = str(item.get("expectation") or "").strip()
+            if path and expectation in {"present", "absent"}:
+                pending_checks.append({"path": path, "expectation": expectation})
+    else:
+        pending = payload.get("pending_verification_paths", [])
+        if not isinstance(pending, list):
+            pending = []
+        pending_checks = [
+            {"path": _normalize_pcm_path(str(item)), "expectation": "present"}
+            for item in pending
+            if str(item).strip()
+        ]
     return OperatorState(
         benchmark_profile=str(payload.get("benchmark_profile") or ""),
         benchmark_id=str(payload.get("benchmark_id") or ""),
@@ -132,12 +158,54 @@ def _load_state(state_path: Path) -> OperatorState:
         harness_url=str(payload.get("harness_url") or ""),
         answer_sent=bool(payload.get("answer_sent", False)),
         answer_outcome=str(payload.get("answer_outcome") or ""),
-        pending_verification_paths=[_normalize_pcm_path(str(item)) for item in pending if str(item).strip()],
+        pending_verification_checks=pending_checks,
     )
 
 
 def _save_state(state_path: Path, state: OperatorState) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(asdict(state), indent=2) + "\n")
+
+
+def _uses_explicit_operator_storage(settings: Settings) -> bool:
+    return settings.state_path_explicit or settings.journal_path_explicit
+
+
+def _bootstrap_state_path(settings: Settings) -> Path:
+    return Path(settings.state_path)
+
+
+def _bootstrap_journal_path(settings: Settings) -> Path:
+    return Path(settings.journal_path)
+
+
+def _run_scoped_storage_paths(settings: Settings, run_id: str) -> tuple[Path, Path]:
+    run_dir = _bootstrap_state_path(settings).parent / "runs" / run_id
+    return run_dir / "operator.state.json", run_dir / "operator.journal.jsonl"
+
+
+def _current_storage_paths(settings: Settings, state: OperatorState) -> tuple[Path, Path]:
+    if _uses_explicit_operator_storage(settings) or not state.run_id:
+        return _bootstrap_state_path(settings), _bootstrap_journal_path(settings)
+    return _run_scoped_storage_paths(settings, state.run_id)
+
+
+def _load_operator_state(settings: Settings) -> OperatorState:
+    bootstrap_path = _bootstrap_state_path(settings)
+    state = _load_state(bootstrap_path)
+    if _uses_explicit_operator_storage(settings) or not state.run_id:
+        return state
+    run_state_path, _journal_path = _run_scoped_storage_paths(settings, state.run_id)
+    if run_state_path.exists():
+        return _load_state(run_state_path)
+    return state
+
+
+def _save_operator_state(settings: Settings, state: OperatorState) -> None:
+    state_path, _journal_path = _current_storage_paths(settings, state)
+    _save_state(state_path, state)
+    if not _uses_explicit_operator_storage(settings) and state_path != _bootstrap_state_path(settings):
+        _save_state(_bootstrap_state_path(settings), state)
 
 
 def _clear_run_context(state: OperatorState) -> None:
@@ -151,7 +219,7 @@ def _clear_trial_context(state: OperatorState) -> None:
     state.harness_url = ""
     state.answer_sent = False
     state.answer_outcome = ""
-    state.pending_verification_paths = []
+    state.pending_verification_checks = []
 
 
 def _print_run_summary(run: Any, run_state_name: Any) -> None:
@@ -183,14 +251,14 @@ def _reconcile_state_with_settings(settings: Settings, state: OperatorState, sta
     if not has_saved_context:
         if current_profile != settings.benchmark_profile or current_benchmark != settings.benchmark_id:
             _sync_state_benchmark(state, settings)
-            _save_state(state_path, state)
+            _save_operator_state(settings, state)
         return
 
     if not current_profile or not current_benchmark:
         print("Saved operator session has no benchmark identity. Clearing stale run/trial context.")
         _clear_run_context(state)
         _sync_state_benchmark(state, settings)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
         return
 
     if current_profile != settings.benchmark_profile or current_benchmark != settings.benchmark_id:
@@ -200,7 +268,7 @@ def _reconcile_state_with_settings(settings: Settings, state: OperatorState, sta
         )
         _clear_run_context(state)
         _sync_state_benchmark(state, settings)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
 
 
 def _print_trial_checkpoint(started: Any) -> None:
@@ -301,6 +369,245 @@ def _pcm_parts(harness_url: str) -> tuple[Any, Any, Any]:
     return client, pb2_mod, errors_mod.ConnectError
 
 
+def _yaml_module() -> Any:
+    try:
+        return import_module("yaml")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Missing PyYAML. Run `uv sync` to install validator dependencies.") from exc
+
+
+def _read_runtime_file(settings: Settings, state: OperatorState, path: str) -> str:
+    normalized = _normalize_pcm_path(path)
+
+    def invoke(client: Any, pb2_mod: Any) -> Any:
+        return client.read(
+            pb2_mod.ReadRequest(
+                path=normalized,
+                number=False,
+                start_line=0,
+                end_line=0,
+            )
+        )
+
+    result = _pcm_call_with_retry(settings, state, invoke)
+    return str(result.content)
+
+
+def _looks_like_frontmatter_markdown(content: str) -> bool:
+    return content.startswith("---\n") or content.startswith("---\r\n")
+
+
+def _split_markdown_frontmatter(content: str) -> tuple[str, str]:
+    lines = content.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("Markdown file does not start with YAML frontmatter.")
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return "".join(lines[1:index]), "".join(lines[index + 1 :])
+    raise ValueError("Unterminated YAML frontmatter block.")
+
+
+def _validate_string_list(value: Any, field_name: str) -> list[str]:
+    if not isinstance(value, list):
+        return [f"`{field_name}` must be a list."]
+    errors: list[str] = []
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, str) or not item.strip():
+            errors.append(f"`{field_name}[{index}]` must be a non-empty string.")
+    return errors
+
+
+def _validate_lines_field(lines: Any, field_name: str = "lines") -> list[str]:
+    if not isinstance(lines, list):
+        return [f"`{field_name}` must be a list."]
+    errors: list[str] = []
+    for index, item in enumerate(lines, start=1):
+        if not isinstance(item, dict):
+            errors.append(f"`{field_name}[{index}]` must be an object.")
+            continue
+        for required in ("item", "quantity", "unit_eur", "line_eur"):
+            if required not in item:
+                errors.append(f"`{field_name}[{index}]` is missing `{required}`.")
+        if "item" in item and (not isinstance(item["item"], str) or not item["item"].strip()):
+            errors.append(f"`{field_name}[{index}].item` must be a non-empty string.")
+        for numeric in ("quantity", "unit_eur", "line_eur"):
+            if numeric in item and (isinstance(item[numeric], bool) or not isinstance(item[numeric], (int, float))):
+                errors.append(f"`{field_name}[{index}].{numeric}` must be numeric.")
+    return errors
+
+
+def _validate_mapping_fields(data: dict[str, Any], required: list[str]) -> list[str]:
+    return [f"Missing required field `{field}`." for field in required if field not in data]
+
+
+def _is_nonempty_scalar(value: Any) -> bool:
+    if value is None or isinstance(value, (list, dict, tuple, set, bool)):
+        return False
+    return bool(str(value).strip())
+
+
+def _validate_inbound_email(data: dict[str, Any]) -> ValidationReport:
+    errors = _validate_mapping_fields(data, ["record_type", "from", "to", "subject", "received_at"])
+    if data.get("record_type") != "inbound_email":
+        errors.append("`record_type` must be `inbound_email`.")
+    if "from" in data and (not isinstance(data["from"], str) or not data["from"].strip()):
+        errors.append("`from` must be a non-empty string.")
+    if "subject" in data and (not isinstance(data["subject"], str) or not data["subject"].strip()):
+        errors.append("`subject` must be a non-empty string.")
+    if "received_at" in data and not _is_nonempty_scalar(data["received_at"]):
+        errors.append("`received_at` must be a non-empty scalar value.")
+    if "to" in data:
+        errors.extend(_validate_string_list(data["to"], "to"))
+    return ValidationReport(kind="inbound-email", ok=not errors, notes=["validated inbound_email frontmatter"], errors=errors)
+
+
+def _validate_outbound_email(data: dict[str, Any]) -> ValidationReport:
+    errors = _validate_mapping_fields(data, ["record_type", "created_at", "send_state", "to", "subject", "attachments"])
+    if data.get("record_type") != "outbound_email":
+        errors.append("`record_type` must be `outbound_email`.")
+    for field_name in ("send_state", "subject"):
+        if field_name in data and (not isinstance(data[field_name], str) or not data[field_name].strip()):
+            errors.append(f"`{field_name}` must be a non-empty string.")
+    if "created_at" in data and not _is_nonempty_scalar(data["created_at"]):
+        errors.append("`created_at` must be a non-empty scalar value.")
+    if "to" in data:
+        errors.extend(_validate_string_list(data["to"], "to"))
+    if "attachments" in data:
+        errors.extend(_validate_string_list(data["attachments"], "attachments"))
+    return ValidationReport(kind="outbound-email", ok=not errors, notes=["validated outbound_email frontmatter"], errors=errors)
+
+
+def _validate_invoice(data: dict[str, Any]) -> ValidationReport:
+    errors = _validate_mapping_fields(
+        data,
+        ["record_type", "invoice_number", "alias", "issued_on", "total_eur", "counterparty", "project", "lines"],
+    )
+    if data.get("record_type") != "invoice":
+        errors.append("`record_type` must be `invoice`.")
+    for field_name in ("invoice_number", "alias", "counterparty", "project"):
+        if field_name in data and (not isinstance(data[field_name], str) or not data[field_name].strip()):
+            errors.append(f"`{field_name}` must be a non-empty string.")
+    if "issued_on" in data and not _is_nonempty_scalar(data["issued_on"]):
+        errors.append("`issued_on` must be a non-empty scalar value.")
+    if "total_eur" in data and (isinstance(data["total_eur"], bool) or not isinstance(data["total_eur"], (int, float))):
+        errors.append("`total_eur` must be numeric.")
+    if "lines" in data:
+        errors.extend(_validate_lines_field(data["lines"]))
+    return ValidationReport(kind="invoice", ok=not errors, notes=["validated invoice frontmatter"], errors=errors)
+
+
+def _validate_bill(data: dict[str, Any]) -> ValidationReport:
+    errors = _validate_mapping_fields(
+        data,
+        ["record_type", "bill_id", "alias", "purchased_on", "total_eur", "counterparty", "project", "lines"],
+    )
+    if data.get("record_type") != "bill":
+        errors.append("`record_type` must be `bill`.")
+    for field_name in ("bill_id", "alias", "counterparty", "project"):
+        if field_name in data and (not isinstance(data[field_name], str) or not data[field_name].strip()):
+            errors.append(f"`{field_name}` must be a non-empty string.")
+    if "purchased_on" in data and not _is_nonempty_scalar(data["purchased_on"]):
+        errors.append("`purchased_on` must be a non-empty scalar value.")
+    if "total_eur" in data and (isinstance(data["total_eur"], bool) or not isinstance(data["total_eur"], (int, float))):
+        errors.append("`total_eur` must be numeric.")
+    if "lines" in data:
+        errors.extend(_validate_lines_field(data["lines"]))
+    return ValidationReport(kind="bill", ok=not errors, notes=["validated bill frontmatter"], errors=errors)
+
+
+def _validate_frontmatter_content(content: str, kind: str) -> ValidationReport:
+    try:
+        frontmatter_text, _body = _split_markdown_frontmatter(content)
+    except ValueError as exc:
+        return ValidationReport(kind=kind, ok=False, errors=[str(exc)])
+
+    yaml_mod = _yaml_module()
+    try:
+        payload = yaml_mod.safe_load(frontmatter_text) if frontmatter_text.strip() else {}
+    except yaml_mod.YAMLError as exc:
+        return ValidationReport(kind=kind, ok=False, errors=[f"Invalid YAML frontmatter: {exc}"])
+
+    if not isinstance(payload, dict):
+        return ValidationReport(kind=kind, ok=False, errors=["Frontmatter must parse to a mapping/object."])
+
+    record_type = str(payload.get("record_type") or "").strip()
+    if kind == "inbound-email":
+        return _validate_inbound_email(payload)
+    if kind == "outbound-email":
+        return _validate_outbound_email(payload)
+    if kind == "finance-record":
+        if record_type == "invoice":
+            return _validate_invoice(payload)
+        if record_type == "bill":
+            return _validate_bill(payload)
+        return ValidationReport(kind=kind, ok=False, errors=["Finance record frontmatter must have `record_type` of `invoice` or `bill`."])
+    if kind == "frontmatter":
+        if record_type == "inbound_email":
+            return _validate_inbound_email(payload)
+        if record_type == "outbound_email":
+            return _validate_outbound_email(payload)
+        if record_type == "invoice":
+            return _validate_invoice(payload)
+        if record_type == "bill":
+            return _validate_bill(payload)
+        return ValidationReport(
+            kind=kind,
+            ok=True,
+            notes=["frontmatter parsed successfully", f"record_type={record_type or '<none>'}"],
+        )
+    return ValidationReport(kind=kind, ok=False, errors=[f"Unsupported frontmatter validation kind: {kind}"])
+
+
+def _detect_validation_kind(path: str, content: str) -> str:
+    suffix = PurePosixPath(_normalize_pcm_path(path)).suffix.lower()
+    if suffix == ".json":
+        return "json"
+    if suffix == ".jsonl":
+        return "jsonl"
+    if suffix in {".yaml", ".yml"}:
+        return "yaml"
+    if suffix == ".md" and _looks_like_frontmatter_markdown(content):
+        return "frontmatter"
+    raise ValueError("Could not auto-detect a supported machine-readable format for this path.")
+
+
+def _validate_content(path: str, content: str, kind: str) -> ValidationReport:
+    resolved_kind = _detect_validation_kind(path, content) if kind == "auto" else kind
+
+    if resolved_kind == "json":
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as exc:
+            return ValidationReport(kind=resolved_kind, ok=False, errors=[f"Invalid JSON: {exc}"])
+        return ValidationReport(kind=resolved_kind, ok=True, notes=["JSON parsed successfully"])
+
+    if resolved_kind == "jsonl":
+        errors: list[str] = []
+        count = 0
+        for index, line in enumerate(content.splitlines(), start=1):
+            if not line.strip():
+                continue
+            count += 1
+            try:
+                json.loads(line)
+            except json.JSONDecodeError as exc:
+                errors.append(f"Line {index}: invalid JSON: {exc}")
+        return ValidationReport(kind=resolved_kind, ok=not errors, notes=[f"validated {count} JSONL line(s)"], errors=errors)
+
+    if resolved_kind == "yaml":
+        yaml_mod = _yaml_module()
+        try:
+            yaml_mod.safe_load(content)
+        except yaml_mod.YAMLError as exc:
+            return ValidationReport(kind=resolved_kind, ok=False, errors=[f"Invalid YAML: {exc}"])
+        return ValidationReport(kind=resolved_kind, ok=True, notes=["YAML parsed successfully"])
+
+    if resolved_kind in {"frontmatter", "inbound-email", "outbound-email", "finance-record"}:
+        return _validate_frontmatter_content(content, resolved_kind)
+
+    return ValidationReport(kind=resolved_kind, ok=False, errors=[f"Unsupported validation kind: {resolved_kind}"])
+
+
 def _pick_next_trial(run: Any, trial_state_enum: Any) -> Any | None:
     for trial in run.trials:
         if trial.state != trial_state_enum.TRIAL_STATE_DONE:
@@ -314,29 +621,68 @@ def _save_state_after_trial_start(state: OperatorState, started: Any) -> None:
     state.harness_url = started.harness_url
     state.answer_sent = False
     state.answer_outcome = ""
-    state.pending_verification_paths = []
+    state.pending_verification_checks = []
+def _format_verification_check(check: dict[str, str]) -> str:
+    expectation = str(check.get("expectation") or "").strip()
+    path = _normalize_pcm_path(str(check.get("path") or ""))
+    return f"{expectation} {path}".strip()
+
+
+def _pending_verification_summary(state: OperatorState) -> str:
+    return ", ".join(_format_verification_check(check) for check in state.pending_verification_checks)
 
 
 def _ensure_active_trial(state: OperatorState) -> int | None:
     if state.trial_id and state.harness_url:
         return None
     print("No active trial in saved state.")
-    print("Start a trial first with `python3 main.py start-trial`.")
+    print("Start a trial first with `uv run python3 main.py start-trial`.")
     return 2
 
 
 def _record_post_command_state(state: OperatorState, command: str, args: argparse.Namespace) -> None:
-    paths = _command_paths(command, args)
-    if _is_mutating_command(command):
-        current = {_normalize_pcm_path(path) for path in state.pending_verification_paths}
-        current.update(paths)
-        state.pending_verification_paths = sorted(current)
+    if not _is_mutating_command(command):
+        return
+    current = {
+        (str(item.get("expectation") or ""), _normalize_pcm_path(str(item.get("path") or "")))
+        for item in state.pending_verification_checks
+        if isinstance(item, dict)
+    }
+    def replace_checks(*checks: tuple[str, str]) -> None:
+        nonlocal current
+        replaced_paths = {_normalize_pcm_path(path) for _expectation, path in checks}
+        current = {
+            (expectation, path)
+            for expectation, path in current
+            if path not in replaced_paths
+        }
+        current.update((expectation, _normalize_pcm_path(path)) for expectation, path in checks)
+
+    if command == "move":
+        replace_checks(
+            ("absent", args.from_name),
+            ("present", args.to_name),
+        )
+    elif command == "delete":
+        replace_checks(("absent", args.path))
+    else:
+        replace_checks(*(("present", path) for path in _command_paths(command, args)))
+    state.pending_verification_checks = [
+        {"expectation": expectation, "path": path}
+        for expectation, path in sorted(current, key=lambda item: (item[1], item[0]))
+    ]
 
 
-def _clear_pending_verification(state: OperatorState, path: str) -> None:
+def _clear_pending_verification(state: OperatorState, path: str, *, expectation: str | None = None) -> None:
     normalized = _normalize_pcm_path(path)
-    state.pending_verification_paths = [
-        item for item in state.pending_verification_paths if not _overlap(item, normalized)
+    state.pending_verification_checks = [
+        item
+        for item in state.pending_verification_checks
+        if not (
+            isinstance(item, dict)
+            and _normalize_pcm_path(str(item.get("path") or "")) == normalized
+            and (expectation is None or str(item.get("expectation") or "") == expectation)
+        )
     ]
 
 
@@ -393,8 +739,8 @@ def _validate_answer_request(settings: Settings, state: OperatorState, args: arg
         return "Use `answer-ok` for OUTCOME_OK. The generic `answer` command is reserved for non-OK outcomes."
 
     refs = [item.strip() for item in getattr(args, "ref", []) if item.strip()]
-    if state.pending_verification_paths:
-        pending = ", ".join(state.pending_verification_paths)
+    if state.pending_verification_checks:
+        pending = _pending_verification_summary(state)
         return f"Verification required before answer. Confirm final state for: {pending}"
 
     return None
@@ -424,8 +770,8 @@ def _validate_answer_ok_request(settings: Settings, state: OperatorState, args: 
             f"Current minimum is {settings.min_ok_refs}. Add more grounding refs or lower BITGN_MIN_OK_REFS."
         )
 
-    if state.pending_verification_paths:
-        pending = ", ".join(state.pending_verification_paths)
+    if state.pending_verification_checks:
+        pending = _pending_verification_summary(state)
         return f"Verification required before answer. Confirm final state for: {pending}"
 
     return None
@@ -463,7 +809,7 @@ def _pcm_call_with_retry(
             print(f"{CLI_YELLOW}RETRY{CLI_CLR}: {exc.code}: {exc.message}")
             if not _refresh_trial_harness(settings, state):
                 raise
-            _save_state(Path(settings.state_path), state)
+            _save_operator_state(settings, state)
             time.sleep(0.2)
     if last_exc is not None:
         raise last_exc
@@ -479,6 +825,17 @@ def _path_kind_guess(path: str) -> str:
     return "unknown"
 
 
+def _detect_runtime_verify_kind(settings: Settings, state: OperatorState, path: str) -> str:
+    normalized = _normalize_pcm_path(path)
+    try:
+        exists, kind = _runtime_path_exists(settings, state, normalized)
+    except Exception:
+        return _path_kind_guess(normalized)
+    if exists:
+        return kind
+    return _path_kind_guess(normalized)
+
+
 def _append_journal_entry(settings: Settings, state: OperatorState, result: Any) -> None:
     payload = {
         "ts": int(time.time()),
@@ -488,14 +845,57 @@ def _append_journal_entry(settings: Settings, state: OperatorState, result: Any)
         "task_id": state.task_id,
         "trial_id": state.trial_id,
         "answer_outcome": state.answer_outcome,
-        "score": result.score,
         "trial_state": int(result.state),
-        "score_detail": list(result.score_detail),
     }
-    journal_path = Path(settings.journal_path)
+    _state_path, journal_path = _current_storage_paths(settings, state)
     journal_path.parent.mkdir(parents=True, exist_ok=True)
     with journal_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+def _handle_jq(args: argparse.Namespace) -> int:
+    jq_binary = shutil.which("jq")
+    if not jq_binary:
+        print("Missing jq on PATH.")
+        return 2
+
+    if args.stdin and args.file:
+        print("Use either --stdin or --file, not both.")
+        return 2
+    if not args.stdin and not args.file:
+        print("Provide --stdin or --file.")
+        return 2
+
+    command = [jq_binary]
+    if args.raw:
+        command.append("-r")
+    if args.pretty is not None:
+        command.extend(["--indent", str(args.pretty)])
+    if args.file:
+        command.extend([args.query, args.file])
+        input_text = None
+    else:
+        command.append(args.query)
+        input_text = sys.stdin.read()
+
+    try:
+        result = subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"jq timed out after {args.timeout}s")
+        return 1
+
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode != 0 and result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
 
 
 def _handle_preanswer(settings: Settings, state: OperatorState) -> int:
@@ -504,15 +904,68 @@ def _handle_preanswer(settings: Settings, state: OperatorState) -> int:
     print(f"- active trial: {state.task_id or '<none>'} ({state.trial_id or '<none>'})")
     print(f"- answer_sent: {str(state.answer_sent).lower()}")
     print(f"- minimum OUTCOME_OK refs: {settings.min_ok_refs}")
-    if state.pending_verification_paths:
-        print("- pending verification paths:")
-        for path in state.pending_verification_paths:
-            print(f"  {path}")
+    if state.pending_verification_checks:
+        print("- pending verification checks:")
+        for check in state.pending_verification_checks:
+            print(f"  {_format_verification_check(check)}")
     else:
-        print("- pending verification paths: none")
+        print("- pending verification checks: none")
     print("- for OUTCOME_OK: refs should cover identity plus final value path")
+    print("- for schema-shaped outputs: `validate /path`, then `verify /path`")
     print("- for ambiguous or unsafe tasks: use the appropriate non-OK outcome")
     return 0
+
+
+def _handle_validate(args: argparse.Namespace, settings: Settings, state: OperatorState) -> int:
+    missing_trial = _ensure_active_trial(state)
+    if missing_trial is not None:
+        return missing_trial
+
+    normalized = _normalize_pcm_path(args.path)
+    try:
+        content = _read_runtime_file(settings, state, normalized)
+        report = _validate_content(normalized, content, args.kind)
+    except Exception as exc:
+        print(str(exc))
+        return 1
+
+    status = f"{CLI_GREEN}VALID{CLI_CLR}" if report.ok else f"{CLI_RED}INVALID{CLI_CLR}"
+    print(f"{status} {normalized} [kind={report.kind}]")
+    for note in report.notes:
+        print(f"- {note}")
+    for error in report.errors:
+        print(f"- {error}")
+    return 0 if report.ok else 1
+
+
+def _is_not_found_error(exc: Any) -> bool:
+    code = str(getattr(exc, "code", "") or "").upper()
+    message = str(getattr(exc, "message", "") or "").lower()
+    if "NOT_FOUND" in code:
+        return True
+    return "not found" in message or "no such" in message
+
+
+def _runtime_path_exists(settings: Settings, state: OperatorState, path: str) -> tuple[bool, str]:
+    normalized = _normalize_pcm_path(path)
+
+    try:
+        def invoke_list(client: Any, pb2_mod: Any) -> Any:
+            return client.list(pb2_mod.ListRequest(name=normalized))
+
+        _pcm_call_with_retry(settings, state, invoke_list)
+        return True, "dir"
+    except Exception as exc:
+        if not _is_not_found_error(exc):
+            raise
+
+    try:
+        _read_runtime_file(settings, state, normalized)
+        return True, "file"
+    except Exception as exc:
+        if _is_not_found_error(exc):
+            return False, "missing"
+        raise
 
 
 def _handle_status(args: argparse.Namespace, settings: Settings, state: OperatorState) -> int:
@@ -564,7 +1017,7 @@ def _handle_start_run(args: argparse.Namespace, settings: Settings, state: Opera
     _clear_run_context(state)
     _sync_state_benchmark(state, settings)
     state.run_id = run.run_id
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     _print_benchmark_target(settings)
     print(f"{CLI_GREEN}Started run{CLI_CLR}: {run.run_id}")
     return 0
@@ -592,7 +1045,7 @@ def _handle_start_trial(args: argparse.Namespace, settings: Settings, state: Ope
             next_trial = _pick_next_trial(run, pb2_mod.TrialState)
             if next_trial is None:
                 print(f"{CLI_GREEN}Run has no unfinished trials.{CLI_CLR}")
-                _save_state(state_path, state)
+                _save_operator_state(settings, state)
                 return 0
             trial_id = next_trial.trial_id
 
@@ -603,7 +1056,7 @@ def _handle_start_trial(args: argparse.Namespace, settings: Settings, state: Ope
 
     _sync_state_benchmark(state, settings)
     _save_state_after_trial_start(state, started)
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     _print_trial_checkpoint(started)
     return 0
 
@@ -620,7 +1073,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
         if state.answer_sent:
             print(
                 "Saved session already has an answered trial. "
-                "Finish it with `python3 main.py end-trial` or clear the session."
+                "Finish it with `uv run python3 main.py end-trial` or clear the session."
             )
             return 2
         try:
@@ -630,7 +1083,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
             return 1
         _sync_state_benchmark(state, settings)
         _save_state_after_trial_start(state, started)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
         print("Resumed saved active trial.")
         _print_trial_checkpoint(started)
         if args.no_inspect:
@@ -652,7 +1105,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
         _clear_run_context(state)
         _sync_state_benchmark(state, settings)
         state.run_id = run.run_id
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
         _print_benchmark_target(settings)
         print(f"{CLI_GREEN}Started run{CLI_CLR}: {run.run_id}")
 
@@ -677,7 +1130,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
 
     _sync_state_benchmark(state, settings)
     _save_state_after_trial_start(state, started)
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     print("Resumed with the next unfinished trial.")
     _print_trial_checkpoint(started)
     if args.no_inspect:
@@ -698,7 +1151,7 @@ def _handle_submit(args: argparse.Namespace, settings: Settings, state: Operator
     print(f"Submitted run {result.run_id} [{pb2_mod.RunState.Name(result.state).removeprefix('RUN_STATE_')}]")
     _clear_run_context(state)
     _sync_state_benchmark(state, settings)
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     return 0
 
 
@@ -706,7 +1159,7 @@ def _handle_session(args: argparse.Namespace, settings: Settings, state: Operato
     if args.clear:
         _clear_run_context(state)
         _sync_state_benchmark(state, settings)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
         print("Cleared saved operator session.")
         return 0
     print(json.dumps(asdict(state), indent=2))
@@ -823,7 +1276,7 @@ def _run_pcm_command(command: str, args: argparse.Namespace, settings: Settings,
 
     print(_format_pcm_result(command, args, result))
     _record_post_command_state(state, command, args)
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     return 0
 
 
@@ -846,9 +1299,31 @@ def _handle_inspect(args: argparse.Namespace, settings: Settings, state: Operato
 
 def _handle_verify(args: argparse.Namespace, settings: Settings, state: OperatorState, state_path: Path) -> int:
     normalized = _normalize_pcm_path(args.path)
+    matching = [
+        item
+        for item in state.pending_verification_checks
+        if isinstance(item, dict) and _normalize_pcm_path(str(item.get("path") or "")) == normalized
+    ]
+    if any(str(item.get("expectation") or "") == "absent" for item in matching):
+        try:
+            exists, _kind = _runtime_path_exists(settings, state, normalized)
+        except Exception as exc:
+            if hasattr(exc, "code") and hasattr(exc, "message"):
+                print(f"{exc.code}: {exc.message}")
+                return 1
+            print(str(exc))
+            return 1
+        if exists:
+            print(f"Verification failed: expected absent {normalized}, but path still exists.")
+            return 1
+        print(f"{CLI_GREEN}VERIFIED{CLI_CLR} absent {normalized}")
+        _clear_pending_verification(state, normalized, expectation="absent")
+        _save_operator_state(settings, state)
+        return 0
+
     kind = args.kind
     if kind == "auto":
-        kind = _path_kind_guess(normalized)
+        kind = _detect_runtime_verify_kind(settings, state, normalized)
     commands: list[tuple[str, argparse.Namespace]]
     if kind == "file":
         commands = [("read", argparse.Namespace(path=normalized, number=False, start_line=0, end_line=0))]
@@ -866,8 +1341,8 @@ def _handle_verify(args: argparse.Namespace, settings: Settings, state: Operator
         exit_code = _run_pcm_command(command, command_args, settings, state, state_path)
         if exit_code != 0:
             return exit_code
-    _clear_pending_verification(state, normalized)
-    _save_state(state_path, state)
+    _clear_pending_verification(state, normalized, expectation="present")
+    _save_operator_state(settings, state)
     return 0
 
 
@@ -882,9 +1357,9 @@ def _handle_end_trial(args: argparse.Namespace, settings: Settings, state: Opera
             "Start that trial in this session first or clear the current session."
         )
         return 2
-    if not state.answer_sent and not args.allow_unanswered:
+    if not state.answer_sent:
         print("Refusing to end trial before answer.")
-        print("Send `python3 main.py answer ...` first or use `python3 main.py end-trial --allow-unanswered`.")
+        print("Send `uv run python3 main.py answer ...` first.")
         return 2
 
     client, pb2_mod, connect_error = _harness_parts(settings)
@@ -900,7 +1375,7 @@ def _handle_end_trial(args: argparse.Namespace, settings: Settings, state: Opera
 
     if state.trial_id == trial_id:
         _clear_trial_context(state)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
     return 0
 
 
@@ -950,13 +1425,18 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--level", type=int, default=2, help="Tree depth when verifying a directory")
     verify_parser.set_defaults(handler="verify")
 
+    validate_parser = subparsers.add_parser("validate", help="Validate a machine-readable runtime file")
+    validate_parser.add_argument("path", help="PCM path to validate")
+    validate_parser.add_argument(
+        "--kind",
+        choices=["auto", "json", "jsonl", "yaml", "frontmatter", "inbound-email", "outbound-email", "finance-record"],
+        default="auto",
+        help="Validation mode",
+    )
+    validate_parser.set_defaults(handler="validate")
+
     end_trial_parser = subparsers.add_parser("end-trial", help="End the active trial after answer")
     end_trial_parser.add_argument("trial_id", nargs="?", help="Explicit trial id; defaults to saved active trial")
-    end_trial_parser.add_argument(
-        "--allow-unanswered",
-        action="store_true",
-        help="Allow end_trial without a prior answer when you intentionally stop on a diagnosed blocker",
-    )
     end_trial_parser.set_defaults(handler="end-trial")
 
     context_parser = subparsers.add_parser("context", help="PCM context")
@@ -1037,6 +1517,15 @@ def _build_parser() -> argparse.ArgumentParser:
     answer_ok_parser.add_argument("--ref", action="append", default=[], help="Grounding ref; may be repeated")
     answer_ok_parser.set_defaults(handler="answer-ok")
 
+    jq_parser = subparsers.add_parser("jq", help="Run a read-only jq query over JSON from stdin or a file")
+    jq_parser.add_argument("--query", required=True, help="jq query expression")
+    jq_parser.add_argument("--file", help="Path to a JSON file")
+    jq_parser.add_argument("--stdin", action="store_true", help="Read JSON from stdin")
+    jq_parser.add_argument("--raw", action="store_true", help="Use jq raw output mode (-r)")
+    jq_parser.add_argument("--pretty", type=int, choices=[0, 1, 2, 3, 4, 5, 6, 7, 8], help="Override jq indent width")
+    jq_parser.add_argument("--timeout", type=int, default=2, help="jq subprocess timeout in seconds")
+    jq_parser.set_defaults(handler="jq")
+
     return parser
 
 
@@ -1045,7 +1534,7 @@ def main() -> int:
     args = parser.parse_args()
     settings = load_settings()
     state_path = Path(settings.state_path)
-    state = _load_state(state_path)
+    state = _load_operator_state(settings)
     _reconcile_state_with_settings(settings, state, state_path)
 
     if args.command in {
@@ -1058,6 +1547,7 @@ def main() -> int:
         "preanswer",
         "inspect",
         "verify",
+        "validate",
         "end-trial",
         "context",
         "tree",
@@ -1095,10 +1585,14 @@ def main() -> int:
             return _handle_inspect(args, settings, state, state_path)
         if args.handler == "verify":
             return _handle_verify(args, settings, state, state_path)
+        if args.handler == "validate":
+            return _handle_validate(args, settings, state)
         if args.handler == "end-trial":
             return _handle_end_trial(args, settings, state, state_path)
         if args.handler == "answer-ok":
             return _handle_answer_ok(args, settings, state, state_path)
+        if args.handler == "jq":
+            return _handle_jq(args)
         if args.handler == "pcm":
             return _execute_pcm(args.command, args, settings, state, state_path)
         parser.print_help()

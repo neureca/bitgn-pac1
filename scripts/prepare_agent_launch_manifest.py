@@ -16,6 +16,7 @@ from prepare_parallel_workers import (
     _save_text,
     _select_trials,
     _launch_start_trial,
+    _write_runtime_env,
 )
 from config import load_settings
 
@@ -42,6 +43,7 @@ def main() -> int:
 
     settings = load_settings()
     _require_api_key(settings.bitgn_api_key)
+    runtime_env_path = _write_runtime_env(base_dir, settings)
     client, pb2_mod, connect_error = _harness_parts(settings.bitgn_host)
 
     parallel_manifest = _load_manifest(parallel_manifest_path)
@@ -90,6 +92,7 @@ def main() -> int:
             trial_id=trial.trial_id,
             state_path=state_path,
             journal_path=journal_path,
+            runtime_env_path=runtime_env_path,
         )
         _save_text(prompt_path, prompt_markdown)
 
@@ -105,6 +108,14 @@ def main() -> int:
             if exit_code != 0:
                 return exit_code
 
+        launch_message = (
+            f"You own only trial {trial.trial_id} ({trial.task_id}). "
+            f"Source {runtime_env_path}, then read {prompt_path} and follow it exactly. "
+            f"Your first reply must confirm reads of AGENTS.md and STATE_MACHINE.md and must list the semantic frame "
+            f"(task restatement, explicit constraints, required obligations, candidate blockers) before any runtime action. "
+            f"Use only its isolated state and journal files."
+        )
+
         assignments.append(
             {
                 "worker_name": worker_name,
@@ -112,14 +123,14 @@ def main() -> int:
                 "trial_id": trial.trial_id,
                 "state_path": str(state_path),
                 "journal_path": str(journal_path),
+                "runtime_env_path": str(runtime_env_path),
                 "prompt_path": str(prompt_path),
-                "prompt_markdown": prompt_markdown,
                 "spawn_recommendation": {
                     "agent_type": "default",
                     "model": args.model,
                     "reasoning_effort": args.reasoning_effort,
-                    "fork_context": True,
-                    "message": prompt_markdown,
+                    "fork_context": False,
+                    "message": launch_message,
                 },
             }
         )
