@@ -18,7 +18,6 @@ CLI_GREEN = "\x1B[32m"
 CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
 CLI_YELLOW = "\x1B[33m"
-LEGACY_DEFAULT_STATE_PATH = Path(".bitgn-run.json")
 
 OUTCOME_NAMES = {
     "OUTCOME_OK",
@@ -194,8 +193,6 @@ def _current_storage_paths(settings: Settings, state: OperatorState) -> tuple[Pa
 def _load_operator_state(settings: Settings) -> OperatorState:
     bootstrap_path = _bootstrap_state_path(settings)
     state = _load_state(bootstrap_path)
-    if not bootstrap_path.exists() and not _uses_explicit_operator_storage(settings) and LEGACY_DEFAULT_STATE_PATH.exists():
-        state = _load_state(LEGACY_DEFAULT_STATE_PATH)
     if _uses_explicit_operator_storage(settings) or not state.run_id:
         return state
     run_state_path, _journal_path = _run_scoped_storage_paths(settings, state.run_id)

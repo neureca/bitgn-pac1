@@ -3,8 +3,5 @@ scripts/__pycache__/
 .venv/
 .DS_Store
 
-.bitgn-run.json
-.bitgn-journal.jsonl
-
 .bitgn-state/*
 !.bitgn-state/README.md

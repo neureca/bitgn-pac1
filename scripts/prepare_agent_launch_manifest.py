@@ -111,6 +111,8 @@ def main() -> int:
         launch_message = (
             f"You own only trial {trial.trial_id} ({trial.task_id}). "
             f"Source {runtime_env_path}, then read {prompt_path} and follow it exactly. "
+            f"Your first reply must confirm reads of AGENTS.md and STATE_MACHINE.md and must list the semantic frame "
+            f"(task restatement, explicit constraints, required obligations, candidate blockers) before any runtime action. "
             f"Use only its isolated state and journal files."
         )
 
