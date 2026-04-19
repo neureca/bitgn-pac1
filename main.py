@@ -18,6 +18,7 @@ CLI_GREEN = "\x1B[32m"
 CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
 CLI_YELLOW = "\x1B[33m"
+LEGACY_DEFAULT_STATE_PATH = Path(".bitgn-run.json")
 
 OUTCOME_NAMES = {
     "OUTCOME_OK",
@@ -40,7 +41,7 @@ class OperatorState:
     harness_url: str = ""
     answer_sent: bool = False
     answer_outcome: str = ""
-    pending_verification_paths: list[str] = field(default_factory=list)
+    pending_verification_checks: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -79,18 +80,6 @@ def _command_paths(command: str, args: argparse.Namespace) -> list[str]:
     if command == "move":
         return [_normalize_pcm_path(args.from_name), _normalize_pcm_path(args.to_name)]
     return []
-def _move_verification_anchor(from_path: str, to_path: str) -> str:
-    left_parts = PurePosixPath(_normalize_pcm_path(from_path)).parts
-    right_parts = PurePosixPath(_normalize_pcm_path(to_path)).parts
-    shared: list[str] = []
-    for left, right in zip(left_parts, right_parts):
-        if left != right:
-            break
-        shared.append(left)
-    if not shared:
-        return "/"
-    anchor = PurePosixPath(*shared).as_posix()
-    return anchor or "/"
 
 
 def _is_mutating_command(command: str) -> bool:
@@ -142,9 +131,25 @@ def _load_state(state_path: Path) -> OperatorState:
         return OperatorState(run_id=str(payload.get("run_id") or ""))
     if not isinstance(payload, dict):
         return OperatorState()
-    pending = payload.get("pending_verification_paths", [])
-    if not isinstance(pending, list):
-        pending = []
+    pending_checks_raw = payload.get("pending_verification_checks")
+    pending_checks: list[dict[str, str]] = []
+    if isinstance(pending_checks_raw, list):
+        for item in pending_checks_raw:
+            if not isinstance(item, dict):
+                continue
+            path = _normalize_pcm_path(str(item.get("path") or ""))
+            expectation = str(item.get("expectation") or "").strip()
+            if path and expectation in {"present", "absent"}:
+                pending_checks.append({"path": path, "expectation": expectation})
+    else:
+        pending = payload.get("pending_verification_paths", [])
+        if not isinstance(pending, list):
+            pending = []
+        pending_checks = [
+            {"path": _normalize_pcm_path(str(item)), "expectation": "present"}
+            for item in pending
+            if str(item).strip()
+        ]
     return OperatorState(
         benchmark_profile=str(payload.get("benchmark_profile") or ""),
         benchmark_id=str(payload.get("benchmark_id") or ""),
@@ -154,12 +159,56 @@ def _load_state(state_path: Path) -> OperatorState:
         harness_url=str(payload.get("harness_url") or ""),
         answer_sent=bool(payload.get("answer_sent", False)),
         answer_outcome=str(payload.get("answer_outcome") or ""),
-        pending_verification_paths=[_normalize_pcm_path(str(item)) for item in pending if str(item).strip()],
+        pending_verification_checks=pending_checks,
     )
 
 
 def _save_state(state_path: Path, state: OperatorState) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(asdict(state), indent=2) + "\n")
+
+
+def _uses_explicit_operator_storage(settings: Settings) -> bool:
+    return settings.state_path_explicit or settings.journal_path_explicit
+
+
+def _bootstrap_state_path(settings: Settings) -> Path:
+    return Path(settings.state_path)
+
+
+def _bootstrap_journal_path(settings: Settings) -> Path:
+    return Path(settings.journal_path)
+
+
+def _run_scoped_storage_paths(settings: Settings, run_id: str) -> tuple[Path, Path]:
+    run_dir = _bootstrap_state_path(settings).parent / "runs" / run_id
+    return run_dir / "operator.state.json", run_dir / "operator.journal.jsonl"
+
+
+def _current_storage_paths(settings: Settings, state: OperatorState) -> tuple[Path, Path]:
+    if _uses_explicit_operator_storage(settings) or not state.run_id:
+        return _bootstrap_state_path(settings), _bootstrap_journal_path(settings)
+    return _run_scoped_storage_paths(settings, state.run_id)
+
+
+def _load_operator_state(settings: Settings) -> OperatorState:
+    bootstrap_path = _bootstrap_state_path(settings)
+    state = _load_state(bootstrap_path)
+    if not bootstrap_path.exists() and not _uses_explicit_operator_storage(settings) and LEGACY_DEFAULT_STATE_PATH.exists():
+        state = _load_state(LEGACY_DEFAULT_STATE_PATH)
+    if _uses_explicit_operator_storage(settings) or not state.run_id:
+        return state
+    run_state_path, _journal_path = _run_scoped_storage_paths(settings, state.run_id)
+    if run_state_path.exists():
+        return _load_state(run_state_path)
+    return state
+
+
+def _save_operator_state(settings: Settings, state: OperatorState) -> None:
+    state_path, _journal_path = _current_storage_paths(settings, state)
+    _save_state(state_path, state)
+    if not _uses_explicit_operator_storage(settings) and state_path != _bootstrap_state_path(settings):
+        _save_state(_bootstrap_state_path(settings), state)
 
 
 def _clear_run_context(state: OperatorState) -> None:
@@ -173,7 +222,7 @@ def _clear_trial_context(state: OperatorState) -> None:
     state.harness_url = ""
     state.answer_sent = False
     state.answer_outcome = ""
-    state.pending_verification_paths = []
+    state.pending_verification_checks = []
 
 
 def _print_run_summary(run: Any, run_state_name: Any) -> None:
@@ -205,14 +254,14 @@ def _reconcile_state_with_settings(settings: Settings, state: OperatorState, sta
     if not has_saved_context:
         if current_profile != settings.benchmark_profile or current_benchmark != settings.benchmark_id:
             _sync_state_benchmark(state, settings)
-            _save_state(state_path, state)
+            _save_operator_state(settings, state)
         return
 
     if not current_profile or not current_benchmark:
         print("Saved operator session has no benchmark identity. Clearing stale run/trial context.")
         _clear_run_context(state)
         _sync_state_benchmark(state, settings)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
         return
 
     if current_profile != settings.benchmark_profile or current_benchmark != settings.benchmark_id:
@@ -222,7 +271,7 @@ def _reconcile_state_with_settings(settings: Settings, state: OperatorState, sta
         )
         _clear_run_context(state)
         _sync_state_benchmark(state, settings)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
 
 
 def _print_trial_checkpoint(started: Any) -> None:
@@ -575,7 +624,15 @@ def _save_state_after_trial_start(state: OperatorState, started: Any) -> None:
     state.harness_url = started.harness_url
     state.answer_sent = False
     state.answer_outcome = ""
-    state.pending_verification_paths = []
+    state.pending_verification_checks = []
+def _format_verification_check(check: dict[str, str]) -> str:
+    expectation = str(check.get("expectation") or "").strip()
+    path = _normalize_pcm_path(str(check.get("path") or ""))
+    return f"{expectation} {path}".strip()
+
+
+def _pending_verification_summary(state: OperatorState) -> str:
+    return ", ".join(_format_verification_check(check) for check in state.pending_verification_checks)
 
 
 def _ensure_active_trial(state: OperatorState) -> int | None:
@@ -589,18 +646,46 @@ def _ensure_active_trial(state: OperatorState) -> int | None:
 def _record_post_command_state(state: OperatorState, command: str, args: argparse.Namespace) -> None:
     if not _is_mutating_command(command):
         return
-    current = {_normalize_pcm_path(path) for path in state.pending_verification_paths}
+    current = {
+        (str(item.get("expectation") or ""), _normalize_pcm_path(str(item.get("path") or "")))
+        for item in state.pending_verification_checks
+        if isinstance(item, dict)
+    }
+    def replace_checks(*checks: tuple[str, str]) -> None:
+        nonlocal current
+        replaced_paths = {_normalize_pcm_path(path) for _expectation, path in checks}
+        current = {
+            (expectation, path)
+            for expectation, path in current
+            if path not in replaced_paths
+        }
+        current.update((expectation, _normalize_pcm_path(path)) for expectation, path in checks)
+
     if command == "move":
-        current.add(_move_verification_anchor(args.from_name, args.to_name))
+        replace_checks(
+            ("absent", args.from_name),
+            ("present", args.to_name),
+        )
+    elif command == "delete":
+        replace_checks(("absent", args.path))
     else:
-        current.update(_command_paths(command, args))
-    state.pending_verification_paths = sorted(current)
+        replace_checks(*(("present", path) for path in _command_paths(command, args)))
+    state.pending_verification_checks = [
+        {"expectation": expectation, "path": path}
+        for expectation, path in sorted(current, key=lambda item: (item[1], item[0]))
+    ]
 
 
-def _clear_pending_verification(state: OperatorState, path: str) -> None:
+def _clear_pending_verification(state: OperatorState, path: str, *, expectation: str | None = None) -> None:
     normalized = _normalize_pcm_path(path)
-    state.pending_verification_paths = [
-        item for item in state.pending_verification_paths if not _overlap(item, normalized)
+    state.pending_verification_checks = [
+        item
+        for item in state.pending_verification_checks
+        if not (
+            isinstance(item, dict)
+            and _normalize_pcm_path(str(item.get("path") or "")) == normalized
+            and (expectation is None or str(item.get("expectation") or "") == expectation)
+        )
     ]
 
 
@@ -657,8 +742,8 @@ def _validate_answer_request(settings: Settings, state: OperatorState, args: arg
         return "Use `answer-ok` for OUTCOME_OK. The generic `answer` command is reserved for non-OK outcomes."
 
     refs = [item.strip() for item in getattr(args, "ref", []) if item.strip()]
-    if state.pending_verification_paths:
-        pending = ", ".join(state.pending_verification_paths)
+    if state.pending_verification_checks:
+        pending = _pending_verification_summary(state)
         return f"Verification required before answer. Confirm final state for: {pending}"
 
     return None
@@ -688,8 +773,8 @@ def _validate_answer_ok_request(settings: Settings, state: OperatorState, args: 
             f"Current minimum is {settings.min_ok_refs}. Add more grounding refs or lower BITGN_MIN_OK_REFS."
         )
 
-    if state.pending_verification_paths:
-        pending = ", ".join(state.pending_verification_paths)
+    if state.pending_verification_checks:
+        pending = _pending_verification_summary(state)
         return f"Verification required before answer. Confirm final state for: {pending}"
 
     return None
@@ -727,7 +812,7 @@ def _pcm_call_with_retry(
             print(f"{CLI_YELLOW}RETRY{CLI_CLR}: {exc.code}: {exc.message}")
             if not _refresh_trial_harness(settings, state):
                 raise
-            _save_state(Path(settings.state_path), state)
+            _save_operator_state(settings, state)
             time.sleep(0.2)
     if last_exc is not None:
         raise last_exc
@@ -745,24 +830,13 @@ def _path_kind_guess(path: str) -> str:
 
 def _detect_runtime_verify_kind(settings: Settings, state: OperatorState, path: str) -> str:
     normalized = _normalize_pcm_path(path)
-
-    def _try_list() -> bool:
-        try:
-            def invoke(client: Any, pb2_mod: Any) -> Any:
-                return client.list(pb2_mod.ListRequest(name=normalized))
-
-            _pcm_call_with_retry(settings, state, invoke)
-            return True
-        except Exception:
-            return False
-
-    if _try_list():
-        return "dir"
     try:
-        _read_runtime_file(settings, state, normalized)
-        return "file"
+        exists, kind = _runtime_path_exists(settings, state, normalized)
     except Exception:
         return _path_kind_guess(normalized)
+    if exists:
+        return kind
+    return _path_kind_guess(normalized)
 
 
 def _append_journal_entry(settings: Settings, state: OperatorState, result: Any) -> None:
@@ -776,7 +850,7 @@ def _append_journal_entry(settings: Settings, state: OperatorState, result: Any)
         "answer_outcome": state.answer_outcome,
         "trial_state": int(result.state),
     }
-    journal_path = Path(settings.journal_path)
+    _state_path, journal_path = _current_storage_paths(settings, state)
     journal_path.parent.mkdir(parents=True, exist_ok=True)
     with journal_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
@@ -833,12 +907,12 @@ def _handle_preanswer(settings: Settings, state: OperatorState) -> int:
     print(f"- active trial: {state.task_id or '<none>'} ({state.trial_id or '<none>'})")
     print(f"- answer_sent: {str(state.answer_sent).lower()}")
     print(f"- minimum OUTCOME_OK refs: {settings.min_ok_refs}")
-    if state.pending_verification_paths:
-        print("- pending verification paths:")
-        for path in state.pending_verification_paths:
-            print(f"  {path}")
+    if state.pending_verification_checks:
+        print("- pending verification checks:")
+        for check in state.pending_verification_checks:
+            print(f"  {_format_verification_check(check)}")
     else:
-        print("- pending verification paths: none")
+        print("- pending verification checks: none")
     print("- for OUTCOME_OK: refs should cover identity plus final value path")
     print("- for schema-shaped outputs: `validate /path`, then `verify /path`")
     print("- for ambiguous or unsafe tasks: use the appropriate non-OK outcome")
@@ -865,6 +939,36 @@ def _handle_validate(args: argparse.Namespace, settings: Settings, state: Operat
     for error in report.errors:
         print(f"- {error}")
     return 0 if report.ok else 1
+
+
+def _is_not_found_error(exc: Any) -> bool:
+    code = str(getattr(exc, "code", "") or "").upper()
+    message = str(getattr(exc, "message", "") or "").lower()
+    if "NOT_FOUND" in code:
+        return True
+    return "not found" in message or "no such" in message
+
+
+def _runtime_path_exists(settings: Settings, state: OperatorState, path: str) -> tuple[bool, str]:
+    normalized = _normalize_pcm_path(path)
+
+    try:
+        def invoke_list(client: Any, pb2_mod: Any) -> Any:
+            return client.list(pb2_mod.ListRequest(name=normalized))
+
+        _pcm_call_with_retry(settings, state, invoke_list)
+        return True, "dir"
+    except Exception as exc:
+        if not _is_not_found_error(exc):
+            raise
+
+    try:
+        _read_runtime_file(settings, state, normalized)
+        return True, "file"
+    except Exception as exc:
+        if _is_not_found_error(exc):
+            return False, "missing"
+        raise
 
 
 def _handle_status(args: argparse.Namespace, settings: Settings, state: OperatorState) -> int:
@@ -916,7 +1020,7 @@ def _handle_start_run(args: argparse.Namespace, settings: Settings, state: Opera
     _clear_run_context(state)
     _sync_state_benchmark(state, settings)
     state.run_id = run.run_id
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     _print_benchmark_target(settings)
     print(f"{CLI_GREEN}Started run{CLI_CLR}: {run.run_id}")
     return 0
@@ -944,7 +1048,7 @@ def _handle_start_trial(args: argparse.Namespace, settings: Settings, state: Ope
             next_trial = _pick_next_trial(run, pb2_mod.TrialState)
             if next_trial is None:
                 print(f"{CLI_GREEN}Run has no unfinished trials.{CLI_CLR}")
-                _save_state(state_path, state)
+                _save_operator_state(settings, state)
                 return 0
             trial_id = next_trial.trial_id
 
@@ -955,7 +1059,7 @@ def _handle_start_trial(args: argparse.Namespace, settings: Settings, state: Ope
 
     _sync_state_benchmark(state, settings)
     _save_state_after_trial_start(state, started)
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     _print_trial_checkpoint(started)
     return 0
 
@@ -982,7 +1086,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
             return 1
         _sync_state_benchmark(state, settings)
         _save_state_after_trial_start(state, started)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
         print("Resumed saved active trial.")
         _print_trial_checkpoint(started)
         if args.no_inspect:
@@ -1004,7 +1108,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
         _clear_run_context(state)
         _sync_state_benchmark(state, settings)
         state.run_id = run.run_id
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
         _print_benchmark_target(settings)
         print(f"{CLI_GREEN}Started run{CLI_CLR}: {run.run_id}")
 
@@ -1029,7 +1133,7 @@ def _handle_resume(args: argparse.Namespace, settings: Settings, state: Operator
 
     _sync_state_benchmark(state, settings)
     _save_state_after_trial_start(state, started)
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     print("Resumed with the next unfinished trial.")
     _print_trial_checkpoint(started)
     if args.no_inspect:
@@ -1050,7 +1154,7 @@ def _handle_submit(args: argparse.Namespace, settings: Settings, state: Operator
     print(f"Submitted run {result.run_id} [{pb2_mod.RunState.Name(result.state).removeprefix('RUN_STATE_')}]")
     _clear_run_context(state)
     _sync_state_benchmark(state, settings)
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     return 0
 
 
@@ -1058,7 +1162,7 @@ def _handle_session(args: argparse.Namespace, settings: Settings, state: Operato
     if args.clear:
         _clear_run_context(state)
         _sync_state_benchmark(state, settings)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
         print("Cleared saved operator session.")
         return 0
     print(json.dumps(asdict(state), indent=2))
@@ -1175,7 +1279,7 @@ def _run_pcm_command(command: str, args: argparse.Namespace, settings: Settings,
 
     print(_format_pcm_result(command, args, result))
     _record_post_command_state(state, command, args)
-    _save_state(state_path, state)
+    _save_operator_state(settings, state)
     return 0
 
 
@@ -1198,6 +1302,28 @@ def _handle_inspect(args: argparse.Namespace, settings: Settings, state: Operato
 
 def _handle_verify(args: argparse.Namespace, settings: Settings, state: OperatorState, state_path: Path) -> int:
     normalized = _normalize_pcm_path(args.path)
+    matching = [
+        item
+        for item in state.pending_verification_checks
+        if isinstance(item, dict) and _normalize_pcm_path(str(item.get("path") or "")) == normalized
+    ]
+    if any(str(item.get("expectation") or "") == "absent" for item in matching):
+        try:
+            exists, _kind = _runtime_path_exists(settings, state, normalized)
+        except Exception as exc:
+            if hasattr(exc, "code") and hasattr(exc, "message"):
+                print(f"{exc.code}: {exc.message}")
+                return 1
+            print(str(exc))
+            return 1
+        if exists:
+            print(f"Verification failed: expected absent {normalized}, but path still exists.")
+            return 1
+        print(f"{CLI_GREEN}VERIFIED{CLI_CLR} absent {normalized}")
+        _clear_pending_verification(state, normalized, expectation="absent")
+        _save_operator_state(settings, state)
+        return 0
+
     kind = args.kind
     if kind == "auto":
         kind = _detect_runtime_verify_kind(settings, state, normalized)
@@ -1218,8 +1344,8 @@ def _handle_verify(args: argparse.Namespace, settings: Settings, state: Operator
         exit_code = _run_pcm_command(command, command_args, settings, state, state_path)
         if exit_code != 0:
             return exit_code
-    _clear_pending_verification(state, normalized)
-    _save_state(state_path, state)
+    _clear_pending_verification(state, normalized, expectation="present")
+    _save_operator_state(settings, state)
     return 0
 
 
@@ -1252,7 +1378,7 @@ def _handle_end_trial(args: argparse.Namespace, settings: Settings, state: Opera
 
     if state.trial_id == trial_id:
         _clear_trial_context(state)
-        _save_state(state_path, state)
+        _save_operator_state(settings, state)
     return 0
 
 
@@ -1411,7 +1537,7 @@ def main() -> int:
     args = parser.parse_args()
     settings = load_settings()
     state_path = Path(settings.state_path)
-    state = _load_state(state_path)
+    state = _load_operator_state(settings)
     _reconcile_state_with_settings(settings, state, state_path)
 
     if args.command in {

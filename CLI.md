@@ -3,8 +3,9 @@
 This repository exposes a stateful operator CLI in `main.py`.
 
 Use it as a saved toolbelt for the BitGN control plane and PCM runtime.
-The CLI persists local operator state in the path from `BITGN_STATE_PATH` or `.bitgn-run.json` by default.
-Completed trials are appended to `BITGN_JOURNAL_PATH` or `.bitgn-journal.jsonl` by default.
+By default, the CLI keeps a small bootstrap state at `.bitgn-state/operator.state.json` and `.bitgn-state/operator.journal.jsonl`.
+When an active run exists, its live state and journal move under `.bitgn-state/runs/<run_id>/...` so old runs do not contaminate new ones.
+`BITGN_STATE_PATH` and `BITGN_JOURNAL_PATH` are advanced overrides for worker/test isolation only and must be set together.
 
 Normative execution rules live in `AGENTS.md`.
 
@@ -87,7 +88,7 @@ The saved state contains:
 - `harness_url`
 - `answer_sent`
 - `answer_outcome`
-- `pending_verification_paths`
+- `pending_verification_checks`
 
 The CLI uses this state to continue run and trial operations across commands.
 
@@ -96,7 +97,7 @@ The CLI uses this state to continue run and trial operations across commands.
 The CLI has hard enforcement for:
 
 - saved benchmark-aware session state
-- pending verification before `answer`
+- pending verification checks before `answer`
 - answer-first before `end-trial`
 - explicit trial mismatch protection on `end-trial`
 - protected/scaffold path mutation blocking unless overridden
@@ -232,7 +233,7 @@ The macro runs:
 
 ### `verify`
 
-Run a saved verification macro for a path after mutation.
+Run a saved verification check for a path after mutation.
 
 ```bash
 uv run python3 main.py verify /docs/todo.txt
@@ -248,6 +249,8 @@ Arguments:
 Note:
 
 - `verify` is the lifecycle verification step that clears pending mutation verification for `answer`
+- `verify` clears the checks attached to the exact path you verify
+- for `move`, verify the old path for expected absence and the new path for expected presence
 
 ### `validate`
 
@@ -377,7 +380,7 @@ Arguments:
 
 Note:
 
-- after `write`, the path is marked for verification before `answer`
+- after `write`, the path is marked for `present` verification before `answer`
 
 ### `mkdir`
 
