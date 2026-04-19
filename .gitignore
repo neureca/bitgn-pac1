@@ -4,4 +4,3 @@ scripts/__pycache__/
 .DS_Store
 
 .bitgn-state/*
-!.bitgn-state/README.md
